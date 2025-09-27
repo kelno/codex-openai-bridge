@@ -31,6 +31,8 @@ _PROFILE_FILES = (
     ("config.toml", "codex_config.toml", ("config.toml",)),
 )
 
+_ASYNCIO_STREAM_LIMIT = 512 * 1024  # 512 KiB to tolerate large tool outputs
+
 
 class _CodexConcurrencyLimiter:
     """Limit how many Codex subprocesses run in parallel."""
@@ -75,6 +77,7 @@ _KNOWN_METADATA_PREFIXES = (
     "searching:",
     "retrying ",
     "error:",
+    "tool ",
 )
 
 
@@ -85,10 +88,23 @@ class _CodexOutputFilter:
         self._saw_assistant = False
         self._emitted_any = False
         self._in_user_block = False
+        self._skip_tool_output = False
+        self._tool_output_depth = 0
 
     def process(self, raw_line: str) -> Optional[str]:
         line = raw_line.rstrip("\r\n")
         stripped = line.strip()
+        if self._skip_tool_output:
+            if not stripped:
+                self._skip_tool_output = False
+                return None
+            if _TIMESTAMP_LINE.match(stripped):
+                self._skip_tool_output = False
+            else:
+                self._tool_output_depth += _json_structure_delta(stripped)
+                if self._tool_output_depth <= 0:
+                    self._skip_tool_output = False
+                return None
         lowered = stripped.lower()
         match = _TIMESTAMP_LINE.match(stripped)
         if match:
@@ -104,6 +120,17 @@ class _CodexOutputFilter:
         if normalized.startswith("assistant:"):
             self._in_user_block = False
             self._saw_assistant = True
+            return None
+
+        if (
+            (" success" in normalized or " failed" in normalized)
+            and normalized.endswith(":")
+            and " in " in normalized
+            and "(" in normalized
+            and ")" in normalized
+        ):
+            self._skip_tool_output = True
+            self._tool_output_depth = 0
             return None
 
         if not stripped:
@@ -155,6 +182,31 @@ def _looks_like_codex_marker(text: str) -> bool:
     if _TIMESTAMP_LINE.match(text) and " codex" in lowered:
         return True
     return False
+
+
+def _json_structure_delta(text: str) -> int:
+    """Compute net change in JSON nesting depth for a given line."""
+
+    delta = 0
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in "[{":
+            delta += 1
+        elif ch in "]}":
+            delta -= 1
+    return delta
 
 
 def _sanitize_codex_text(raw: str) -> str:
@@ -379,6 +431,7 @@ async def list_codex_models() -> List[str]:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=settings.codex_workdir,
                 env=codex_env,
+                limit=_ASYNCIO_STREAM_LIMIT,
             )
         except FileNotFoundError as e:
             raise CodexError(
@@ -580,6 +633,7 @@ async def _probe_models_via_proto(exe: str) -> List[str]:
             stderr=asyncio.subprocess.PIPE,
             cwd=settings.codex_workdir,
             env=codex_env,
+            limit=_ASYNCIO_STREAM_LIMIT,
         )
     except FileNotFoundError as exc:
         raise CodexError(f"Failed to launch codex proto: {exc}")
@@ -691,6 +745,7 @@ async def run_codex(
                 stderr=asyncio.subprocess.PIPE,
                 cwd=settings.codex_workdir,
                 env=codex_env,
+                limit=_ASYNCIO_STREAM_LIMIT,
             )
         except FileNotFoundError as e:
             raise CodexError(
@@ -750,18 +805,19 @@ async def run_codex_last_message(
                 stderr=asyncio.subprocess.PIPE,
                 cwd=settings.codex_workdir,
                 env=codex_env,
+                limit=_ASYNCIO_STREAM_LIMIT,
             )
             stdout_data, stderr_data = await asyncio.wait_for(
                 proc.communicate(), timeout=settings.timeout_seconds
             )
-            if proc.returncode != 0:
-                err = (stderr_data or b"").decode().strip() or "codex execution failed"
-                raise CodexError(err)
-            try:
-                with open(out_path, "r", encoding="utf-8", errors="ignore") as f:
-                    text = f.read()
-            except Exception:
-                text = ""
+        if proc.returncode != 0:
+            err = (stderr_data or b"").decode().strip() or "codex execution failed"
+            raise CodexError(err)
+        try:
+            with open(out_path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except Exception:
+            text = ""
 
             if not text:
                 # Fallback to any stdout text when the file is empty or missing.
