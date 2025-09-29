@@ -819,13 +819,13 @@ async def run_codex_last_message(
         except Exception:
             text = ""
 
-            if not text:
-                # Fallback to any stdout text when the file is empty or missing.
-                text = (stdout_data or b"").decode(errors="ignore")
-            sanitized = _sanitize_codex_text(text)
-            if sanitized:
-                return sanitized
-            return text.strip()
+        if not text:
+            # Fallback to any stdout text when the file is empty or missing.
+            text = (stdout_data or b"").decode(errors="ignore")
+        sanitized = _sanitize_codex_text(text)
+        if sanitized:
+            return sanitized
+        return text.strip()
     except asyncio.TimeoutError:
         raise CodexError("codex execution timed out")
     finally:
