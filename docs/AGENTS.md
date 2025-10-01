@@ -296,6 +296,7 @@ cp docs/examples/codex-config.example.toml ~/.codex/config.toml
 
 - For OpenAI in API‑key mode set `OPENAI_API_KEY` (OAuth mode does not need it).
 - Enable web search via `tools.web_search = true` in `config.toml`.
+  - 注意: Codex プロファイルで web_search を有効化した場合、`reasoning_effort="minimal"` を指定したリクエストでは OpenAI 側がツール利用を禁止しているため 400 エラー (`The following tools cannot be used with reasoning.effort 'minimal': web_search.`) になります。`low`/`medium`/`high` のいずれかを使用してください。
 - Define MCP servers under `mcp_servers.<id>` (stdio).
 - API 専用の設定を分離したい場合は `.env` に `CODEX_CONFIG_DIR` を設定します。Codex ランタイムはこの値を `CODEX_HOME` として扱い、`config.toml` や MCP 定義をラッパー専用にできます。
 
