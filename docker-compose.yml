@@ -1,0 +1,21 @@
+services:
+  codex-wrapper:
+    build:
+      context: .
+    image: codex-wrapper:local
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      PROXY_API_KEY: ${PROXY_API_KEY:-}
+      CODEX_LOCAL_ONLY: ${CODEX_LOCAL_ONLY:-0}
+      CODEX_ALLOW_DANGER_FULL_ACCESS: ${CODEX_ALLOW_DANGER_FULL_ACCESS:-0}
+      CODEX_WORKDIR: /workspace
+    volumes:
+      - workspace-data:/workspace
+      - codex-home:/home/appuser/.codex
+    env_file:
+      - .env
+volumes:
+  workspace-data:
+  codex-home:
