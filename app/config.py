@@ -9,12 +9,16 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     proxy_api_key: Optional[str] = Field(default=None, alias="PROXY_API_KEY")
+    # Docker ビルドで使用するホスト UID/GID。アプリ本体では未使用だが、.env の互換性維持のため受理する。
+    host_uid: Optional[int] = Field(default=None, alias="HOST_UID")
+    host_gid: Optional[int] = Field(default=None, alias="HOST_GID")
     codex_workdir: str = Field(default="/workspace", alias="CODEX_WORKDIR")
     codex_config_dir: Optional[str] = Field(default=None, alias="CODEX_CONFIG_DIR")
     codex_profile_dir: Optional[str] = Field(
         default=None, alias="CODEX_WRAPPER_PROFILE_DIR"
     )
     codex_path: str = Field(default="codex", alias="CODEX_PATH")
+    codex_node_path: Optional[str] = Field(default=None, alias="CODEX_NODE_PATH")
     sandbox_mode: str = Field(default="read-only", alias="CODEX_SANDBOX_MODE")
     workspace_network_access: bool = Field(
         default=False, alias="CODEX_WORKSPACE_NETWORK_ACCESS"

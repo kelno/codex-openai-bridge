@@ -122,6 +122,35 @@ See `docs/IMPLEMENTATION_PLAN.ja.md` (Japanese) and `docs/AGENTS.md` for details
 > Streaming responses now forward Codex CLI output verbatim. Adjust your Codex profile/config if you want to suppress banners or warnings.
 > Requests are executed concurrently up to the configured `CODEX_MAX_PARALLEL_REQUESTS` limit (default 2).
 
+## Docker
+
+The repository ships a Dockerfile that bundles this FastAPI wrapper together with the Codex CLI.
+
+### Build the image
+
+```bash
+docker build -t codex-wrapper .
+```
+
+### Run with Docker Compose (recommended for local development)
+
+```bash
+# Build the image declared in docker-compose.yml
+docker compose build
+
+# Run Codex authentication once (OAuth or API key) inside the container
+docker compose run --rm codex-wrapper codex login
+
+# Start the API server (binds to localhost:8000 by default)
+docker compose up
+```
+
+Notes
+- The compose file bind-mounts `${HOME}/.codex` into the container so it reuses the same Codex credentials you already configured in WSL. Make sure the directory exists (`mkdir -p ~/.codex`) before running `docker compose`.
+- `.env` is loaded via `env_file` to keep configuration in sync with non-container runs.
+- The container exposes the same `/v1/models` discovery as the bare-metal setup because the server still shells out to the bundled Codex CLI (`codex models list`).
+- You can launch ad-hoc Codex commands inside the container, for example `docker compose run --rm codex-wrapper codex models list`, to troubleshoot authentication before starting the API.
+
 ### Models exposed by `/v1/models`
 
 Sample response on 2025-09-18 (call the endpoint in your environment to confirm):

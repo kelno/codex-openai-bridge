@@ -124,6 +124,35 @@ client = OpenAI(base_url="http://localhost:8000/v1", api_key="YOUR_PROXY_API_KEY
 > ストリーミング応答は Codex CLI の出力をそのまま転送します。バナーや警告を抑止したい場合は Codex 側のプロファイル／設定で制御してください。
 > API リクエストは `CODEX_MAX_PARALLEL_REQUESTS`（既定 2）で指定した上限まで並列実行されます。
 
+## Docker
+
+本リポジトリには FastAPI ラッパーと Codex CLI をまとめてコンテナ化する Dockerfile が同梱されています。
+
+### イメージのビルド
+
+```bash
+docker build -t codex-wrapper .
+```
+
+### Docker Compose での起動（ローカル開発ではこちらを推奨）
+
+```bash
+# docker-compose.yml に定義したイメージをビルド
+docker compose build
+
+# コンテナ内で一度だけ Codex のログイン（OAuth または API キー）を実施
+docker compose run --rm codex-wrapper codex login
+
+# API サーバーを起動（ホスト側はデフォルトで localhost:8000 に公開）
+docker compose up
+```
+
+補足
+- Compose では `${HOME}/.codex` をバインドマウントし、WSL で既に設定済みの Codex 認証情報をそのまま利用できます。実行前に `~/.codex` が存在することを確認してください（`mkdir -p ~/.codex`）。
+- `.env` は `env_file` として読み込まれるため、非コンテナ運用と同じ設定をそのまま使えます。
+- コンテナでもサーバーは従来どおり Codex CLI (`codex models list`) を呼び出してモデル一覧を取得するため、`/v1/models` の挙動はスタンドアロンと同一です。
+- 起動前に認証やモデル一覧を確認したい場合は `docker compose run --rm codex-wrapper codex models list` のようにコンテナ内でコマンドを実行できます。
+
 ### `/v1/models` で取得できるモデル一覧
 
 2025-09-18 時点でのサンプルレスポンス（ご自身の環境でエンドポイントを呼び出して最新情報を確認してください）：

@@ -4,10 +4,13 @@ import logging
 import os
 import re
 import shutil
+import threading
 import tempfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 try:
     import tomllib
@@ -20,8 +23,18 @@ from .config import settings
 class CodexError(Exception):
     """Custom error for Codex failures."""
 
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_CODEX_MODEL = "codex-cli"
+_FALLBACK_MODELS = (DEFAULT_CODEX_MODEL,)
+_SKIP_PRESET_PREFIXES = ("swiftfox",)
+_DEFAULT_REASONING_EFFORTS = ("low", "medium", "high")
+_ALLOWED_REASONING_EFFORTS = set(_DEFAULT_REASONING_EFFORTS)
 
 _DEFAULT_PROFILE_DIR = (
     Path(__file__).resolve().parent.parent / "workspace" / "codex_profile"
@@ -32,6 +45,10 @@ _PROFILE_FILES = (
 )
 
 _ASYNCIO_STREAM_LIMIT = 512 * 1024  # 512 KiB to tolerate large tool outputs
+
+_WORKDIR_LOCK = threading.Lock()
+_WORKDIR_PATH: Optional[Path] = None
+_WORKDIR_NEEDS_SKIP_GIT_CHECK = False
 
 
 class _CodexConcurrencyLimiter:
@@ -59,6 +76,14 @@ class _CodexConcurrencyLimiter:
 
 
 _parallel_limiter = _CodexConcurrencyLimiter(settings.max_parallel_requests)
+
+
+@dataclass(frozen=True)
+class ModelPresetEntry:
+    """Representation of a Codex CLI model preset."""
+
+    model: str
+    effort: Optional[str] = None
 
 
 _TIMESTAMP_LINE = re.compile(r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}]")
@@ -243,33 +268,176 @@ def _resolve_codex_executable() -> str:
 
 
 def _ensure_workdir_exists() -> None:
-    """Ensure Codex working directory exists."""
+    """Ensure Codex working directory exists and is writable, falling back if needed."""
 
-    try:
-        os.makedirs(settings.codex_workdir, exist_ok=True)
-    except Exception as e:
-        raise CodexError(
-            f"Failed to create CODEX_WORKDIR '{settings.codex_workdir}': {e}"
-        )
+    global _WORKDIR_PATH, _WORKDIR_NEEDS_SKIP_GIT_CHECK
+    if _WORKDIR_PATH is not None:
+        return
+
+    with _WORKDIR_LOCK:
+        if _WORKDIR_PATH is not None:
+            return
+
+        requested_path = Path(settings.codex_workdir).expanduser()
+        candidates: list[Path] = [requested_path]
+
+        fallback_candidates = [
+            Path(tempfile.gettempdir()) / "codex-workdir",
+            Path.home() / ".cache" / "codex-wrapper",
+        ]
+        for fallback in fallback_candidates:
+            if fallback not in candidates:
+                candidates.append(fallback)
+
+        errors: list[tuple[Path, Exception]] = []
+        resolved: Optional[Path] = None
+
+        for candidate in candidates:
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                _verify_directory_write_access(candidate)
+            except Exception as exc:
+                errors.append((candidate, exc))
+                logger.warning(
+                    "Unable to prepare Codex work directory '%s': %s", candidate, exc
+                )
+                continue
+
+            resolved = candidate
+            break
+
+        if resolved is None:
+            detail = "; ".join(f"{path}: {err}" for path, err in errors) or "no candidates"
+            raise CodexError(f"Failed to prepare Codex work directory ({detail})")
+
+        requested_resolved = requested_path
+        with suppress(Exception):
+            requested_resolved = requested_path.resolve()
+        with suppress(Exception):
+            resolved = resolved.resolve()
+        if resolved != requested_resolved:
+            logger.warning(
+                "CODEX_WORKDIR '%s' is not writable; falling back to '%s'",
+                requested_path,
+                resolved,
+            )
+
+        resolved_str = str(resolved)
+        settings.codex_workdir = resolved_str
+        _WORKDIR_PATH = resolved
+        _WORKDIR_NEEDS_SKIP_GIT_CHECK = not _is_git_repository(resolved)
+
+
+def _is_git_repository(path: Path) -> bool:
+    current = path
+    with suppress(Exception):
+        current = path.resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return True
+        if candidate == candidate.parent:
+            break
+    return False
 
 
 def _resolve_codex_home_dir() -> Path:
     """Return the directory Codex CLI uses as its home, ensuring it exists."""
 
+    candidates: list[Path] = []
+    errors: list[tuple[Path, Exception]] = []
+    resolved: Optional[Path] = None
+
     if settings.codex_config_dir:
-        target = Path(settings.codex_config_dir).expanduser()
-    else:
-        env_home = os.environ.get("CODEX_HOME")
-        if env_home:
-            target = Path(env_home).expanduser()
-        else:
-            target = Path.home() / ".codex"
+        candidates.append(Path(settings.codex_config_dir).expanduser())
+
+    env_home = os.environ.get("CODEX_HOME")
+    if env_home:
+        env_path = Path(env_home).expanduser()
+        if env_path not in candidates:
+            candidates.append(env_path)
+
+    default_home = Path.home() / ".codex"
+    if default_home not in candidates:
+        candidates.append(default_home)
+
+    workspace_home = Path(settings.codex_workdir).expanduser() / ".codex"
+    if workspace_home not in candidates:
+        candidates.append(workspace_home)
+
+    temp_home = Path(tempfile.gettempdir()) / "codex"
+    if temp_home not in candidates:
+        candidates.append(temp_home)
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            _verify_directory_write_access(candidate)
+        except Exception as exc:
+            errors.append((candidate, exc))
+            logger.warning(
+                "Unable to prepare Codex home directory '%s': %s", candidate, exc
+            )
+            continue
+
+        resolved = candidate
+        break
+
+    if resolved is None:
+        detail = "; ".join(f"{path}: {err}" for path, err in errors) or "no candidates"
+        raise CodexError(f"Failed to prepare Codex home directory ({detail})")
+
+    if errors:
+        joined = "; ".join(f"{path}: {err}" for path, err in errors)
+        logger.warning(
+            "Using Codex home directory '%s' after fallback (previous attempts: %s)",
+            resolved,
+            joined,
+        )
+
+    _configure_codex_home_environment(resolved, bool(errors))
+    return resolved
+
+
+def _verify_directory_write_access(directory: Path) -> None:
+    test_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=directory, prefix="codex-perm-", delete=False
+        ) as handle:
+            handle.write(b"codex")
+            handle.flush()
+            test_path = Path(handle.name)
+    except Exception as exc:  # pragma: no cover - startup failure path
+        raise PermissionError(f"write test failed: {exc}") from exc
+    finally:
+        if test_path:
+            with suppress(Exception):
+                test_path.unlink()
+
+
+def _configure_codex_home_environment(resolved: Path, had_errors: bool) -> None:
+    resolved_str = str(resolved)
+    previous_env = os.environ.get("CODEX_HOME")
+    default_home = Path.home() / ".codex"
+
+    if previous_env != resolved_str:
+        if previous_env and previous_env != resolved_str:
+            logger.warning(
+                "Overriding unusable CODEX_HOME '%s' with '%s'.",
+                previous_env,
+                resolved_str,
+            )
+        elif had_errors:
+            logger.warning("Setting CODEX_HOME to fallback directory '%s'.", resolved_str)
+        elif resolved != default_home:
+            logger.info("Setting CODEX_HOME to configured directory '%s'.", resolved_str)
+        os.environ["CODEX_HOME"] = resolved_str
 
     try:
-        target.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:
-        raise CodexError(f"Failed to prepare Codex home directory '{target}': {exc}")
-    return target
+        if settings.codex_config_dir != resolved_str:
+            settings.codex_config_dir = resolved_str
+    except Exception:  # pragma: no cover - defensive best effort
+        pass
 
 
 def apply_codex_profile_overrides() -> None:
@@ -332,6 +500,29 @@ def _build_codex_env() -> Dict[str, str]:
                 f"Failed to prepare CODEX_CONFIG_DIR '{config_dir}': {exc}"
             )
         env["CODEX_HOME"] = config_dir
+
+    # Ensure `node` is available for Codex CLI shims when running under nvm.
+    if shutil.which("node", path=env.get("PATH", "")) is None:
+        candidate_dirs: List[Path] = []
+        codex_node_path = getattr(settings, "codex_node_path", None)
+        if codex_node_path:
+            candidate_dirs.append(Path(codex_node_path))
+        nvm_versions = Path.home() / ".nvm" / "versions" / "node"
+        if nvm_versions.is_dir():
+            for child in sorted(nvm_versions.iterdir(), reverse=True):
+                bin_dir = child / "bin"
+                if bin_dir.is_dir():
+                    candidate_dirs.append(bin_dir)
+        if candidate_dirs:
+            original_path = env.get("PATH", "")
+            path_parts = original_path.split(os.pathsep) if original_path else []
+            for candidate in candidate_dirs:
+                candidate_str = str(candidate)
+                if candidate_str not in path_parts:
+                    path_parts.insert(0, candidate_str)
+                if shutil.which("node", path=os.pathsep.join(path_parts)) is not None:
+                    env["PATH"] = os.pathsep.join(path_parts)
+                    break
     return env
 
 
@@ -344,9 +535,16 @@ def _build_cmd_and_env(
     """Build base `codex exec` command with configs and optional images."""
     cfg = {
         "sandbox_mode": settings.sandbox_mode,
-        "model_reasoning_effort": settings.reasoning_effort,
         "hide_agent_reasoning": settings.hide_reasoning,
     }
+    default_effort = (
+        settings.reasoning_effort.strip().lower()
+        if isinstance(settings.reasoning_effort, str)
+        else None
+    )
+    if default_effort in _ALLOWED_REASONING_EFFORTS:
+        cfg["model_reasoning_effort"] = default_effort
+
     # Map API overrides (x_codex) to Codex config keys
     if overrides:
         mapped: Dict[str, object] = {}
@@ -373,9 +571,21 @@ def _build_cmd_and_env(
 
     # Note: Rust CLI does not support `-q`. Use human output or JSON mode selectively.
     cmd = [exe, "exec", prompt, "--color", "never"]
+    if _WORKDIR_NEEDS_SKIP_GIT_CHECK:
+        cmd.append("--skip-git-repo-check")
     if images:
         for img in images:
             cmd += ["--image", img]
+
+    if (
+        model
+        and model.startswith("gpt-5")
+        and "model_reasoning_effort" in cfg
+        and not (overrides and overrides.get("reasoning_effort"))
+    ):
+        # Respect explicit reasoning aliases only; base gpt-5 should default to CLI behaviour.
+        cfg.pop("model_reasoning_effort", None)
+
     for key, value in cfg.items():
         if key == "network_access":
             # handled separately when sandbox_mode is workspace-write
@@ -408,274 +618,104 @@ def _build_cmd_and_env(
     return cmd
 
 
-async def list_codex_models() -> List[str]:
-    """Query the Codex CLI for available models."""
+@lru_cache(maxsize=1)
+def load_builtin_model_presets() -> List[ModelPresetEntry]:
+    """Load model presets defined in the Codex CLI submodule."""
 
-    exe = _resolve_codex_executable()
-    _ensure_workdir_exists()
-    codex_env = _build_codex_env()
-
-    attempts = [
-        [exe, "models", "list", "--json"],
-        [exe, "models", "--json"],
-        [exe, "models", "list"],
-        [exe, "models"],
-    ]
-    errors: List[str] = []
-
-    for cmd in attempts:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=settings.codex_workdir,
-                env=codex_env,
-                limit=_ASYNCIO_STREAM_LIMIT,
-            )
-        except FileNotFoundError as e:
-            raise CodexError(
-                f"Failed to launch codex: {e}. Check CODEX_PATH and PATH."
-            )
-        except PermissionError as e:
-            raise CodexError(
-                f"Permission error launching codex: {e}. Ensure the binary is executable."
-            )
-        except Exception as e:  # pragma: no cover - unexpected failure
-            errors.append(f"{' '.join(cmd)} -> {e}")
-            continue
-
-        try:
-            stdout_data, stderr_data = await asyncio.wait_for(
-                proc.communicate(), timeout=settings.timeout_seconds
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            errors.append(f"{' '.join(cmd)} -> timed out")
-            continue
-
-        if proc.returncode != 0:
-            err_text = (stderr_data or b"").decode().strip() or f"exit code {proc.returncode}"
-            errors.append(f"{' '.join(cmd)} -> {err_text}")
-            continue
-
-        models = _parse_model_listing((stdout_data or b"").decode())
-        if models:
-            logger.debug("Resolved Codex models via '%s': %s", " ".join(cmd), models)
-            return models
-
-        errors.append(f"{' '.join(cmd)} -> no models returned")
+    preset_path = (
+        Path(__file__).resolve().parent.parent
+        / "submodules"
+        / "codex"
+        / "codex-rs"
+        / "common"
+        / "src"
+        / "model_presets.rs"
+    )
 
     try:
-        proto_models = await _probe_models_via_proto(exe)
-    except Exception as exc:  # pragma: no cover - network/process failure path
-        errors.append(f"{exe} proto -> {exc}")
-    else:
-        if proto_models:
-            logger.debug("Resolved Codex models via 'proto': %s", proto_models)
-            return proto_models
-        errors.append(f"{exe} proto -> no models returned")
-
-    try:
-        config_models = _models_from_config()
-    except Exception as exc:  # pragma: no cover - file parsing failure
-        errors.append(f"config.toml -> {exc}")
-    else:
-        if config_models:
-            logger.debug("Resolved Codex models via config: %s", config_models)
-            return config_models
-        errors.append("config.toml -> no models returned")
-
-    detail = "; ".join(errors) if errors else "no output"
-    logger.warning("Unable to list Codex models (%s)", detail)
-    raise CodexError(f"Unable to list Codex models ({detail})")
-
-
-def _parse_model_listing(raw: str) -> List[str]:
-    """Parse Codex CLI model listings from JSON or plaintext."""
-
-    if not raw:
+        raw = preset_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        logger.warning("Codex model preset file not found: %s", preset_path)
+        return []
+    except Exception as exc:  # pragma: no cover - unexpected IO failure
+        logger.warning("Failed to read Codex model presets from %s: %s", preset_path, exc)
         return []
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-    else:
-        items = None
-        if isinstance(data, dict):
-            for key in ("data", "models", "items"):
-                value = data.get(key)
-                if isinstance(value, list):
-                    items = value
-                    break
-            else:
-                if isinstance(data.get("id"), str):
-                    items = [data]
-        elif isinstance(data, list):
-            items = data
+    block_pattern = re.compile(r"ModelPreset\s*{([^}]*)}", re.DOTALL)
+    model_pattern = re.compile(r'model:\s*"([^"]+)"')
+    effort_pattern = re.compile(r'effort:\s*Some\(ReasoningEffort::([A-Za-z]+)\)')
 
-        if items is not None:
-            parsed: List[str] = []
-            for item in items:
-                parsed.extend(_extract_model_identifiers(item))
-            return _dedupe_preserving_order(parsed)
-
-    parsed_lines: List[str] = []
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped:
+    presets: List[ModelPresetEntry] = []
+    for match in block_pattern.finditer(raw):
+        block = match.group(1)
+        model_match = model_pattern.search(block)
+        if not model_match:
             continue
-        lower = stripped.lower()
-        if lower.startswith("available models"):
+        model = model_match.group(1).strip()
+        if not model:
             continue
-        parts = stripped.split()
-        if not parts:
+        if any(model.startswith(prefix) for prefix in _SKIP_PRESET_PREFIXES):
             continue
-        token = parts[0]
-        lowered_token = token.lower()
-        if lowered_token in {"model", "name", "id"}:
+        effort_match = effort_pattern.search(block)
+        effort = effort_match.group(1).lower() if effort_match else None
+        presets.append(ModelPresetEntry(model=model, effort=effort))
+
+    if not presets:
+        logger.warning("Parsed zero Codex model presets from %s", preset_path)
+    return presets
+
+
+def builtin_reasoning_aliases() -> Dict[str, Tuple[str, ...]]:
+    """Return reasoning effort aliases keyed by model slug."""
+
+    aliases: Dict[str, List[str]] = {}
+    for preset in load_builtin_model_presets():
+        if not preset.effort:
             continue
-        parsed_lines.append(token)
-        if len(parts) > 1:
-            for variant in parts[1:]:
-                alias = _compose_codex_variant_name(token, variant)
-                if alias:
-                    parsed_lines.append(alias)
+        if preset.effort not in _ALLOWED_REASONING_EFFORTS:
+            continue
+        bucket = aliases.setdefault(preset.model, [])
+        if preset.effort not in bucket:
+            bucket.append(preset.effort)
 
-    return _dedupe_preserving_order(parsed_lines)
+    # Ensure codex-cli also exposes low/medium/high aliases for convenience.
+    codex_bucket = aliases.setdefault(DEFAULT_CODEX_MODEL, [])
+    for effort in _DEFAULT_REASONING_EFFORTS:
+        if effort not in codex_bucket:
+            codex_bucket.append(effort)
 
-
-def _extract_model_identifiers(item: Any) -> List[str]:
-    if isinstance(item, str):
-        cleaned = item.strip()
-        return [cleaned] if cleaned else []
-    if isinstance(item, dict):
-        return _extract_model_identifiers_from_dict(item)
-    return []
+    return {model: tuple(values) for model, values in aliases.items()}
 
 
-def _extract_model_identifiers_from_dict(data: Dict[str, Any]) -> List[str]:
-    results: List[str] = []
-    base = _first_non_empty_string(data, ("id", "model", "name", "slug"))
-    if base:
-        results.append(base)
+async def list_codex_models() -> List[str]:
+    """Return available models without shelling out to the Codex CLI binary."""
 
-    for key in ("deployment", "variant"):
-        results.extend(_collect_codex_aliases(base, data.get(key)))
+    presets = load_builtin_model_presets()
+    models: List[str] = []
+    for preset in presets:
+        if preset.model and preset.model not in models:
+            models.append(preset.model)
 
-    for key in ("deployments", "variants"):
-        results.extend(_collect_codex_aliases(base, data.get(key)))
+    config_models = _models_from_config()
+    for model in config_models:
+        if model and model not in models:
+            models.append(model)
 
-    return results
-
-
-def _first_non_empty_string(data: Dict[str, Any], keys: Iterable[str]) -> Optional[str]:
-    for key in keys:
-        value = data.get(key)
-        if isinstance(value, str):
-            stripped = value.strip()
-            if stripped:
-                return stripped
-    return None
-
-
-def _collect_codex_aliases(base: Optional[str], raw_value: Any) -> List[str]:
-    aliases: List[str] = []
-    for variant in _iter_variant_strings(raw_value):
-        alias = _compose_codex_variant_name(base, variant)
-        if alias:
-            aliases.append(alias)
-    return aliases
-
-
-def _iter_variant_strings(value: Any) -> Iterable[str]:
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, list):
-        for entry in value:
-            yield from _iter_variant_strings(entry)
-    elif isinstance(value, dict):
-        for key in ("id", "name", "variant", "deployment"):
-            maybe = value.get(key)
-            if isinstance(maybe, str):
-                yield maybe
-
-
-def _compose_codex_variant_name(base: Optional[str], variant: str) -> Optional[str]:
-    if not variant:
-        return None
-    normalized_variant = re.sub(r"[^0-9a-zA-Z._-]+", "-", variant.strip().lower())
-    normalized_variant = re.sub(r"-+", "-", normalized_variant).strip("-")
-    if not normalized_variant or "codex" not in normalized_variant:
-        return None
-
-    base_name = base.strip() if isinstance(base, str) else ""
-    if base_name:
-        if base_name.lower().endswith(f"-{normalized_variant}"):
-            return None
-        return f"{base_name}-{normalized_variant}"
-    return normalized_variant
-
-
-async def _probe_models_via_proto(exe: str) -> List[str]:
-    """Use `codex proto` to discover the current default model."""
-
-    codex_env = _build_codex_env()
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            exe,
-            "proto",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=settings.codex_workdir,
-            env=codex_env,
-            limit=_ASYNCIO_STREAM_LIMIT,
+    if models:
+        if "gpt-5" not in models:
+            models.append("gpt-5")
+        for fallback in reversed(_FALLBACK_MODELS):
+            if fallback not in models:
+                models.insert(0, fallback)
+        logger.debug(
+            "Resolved Codex models from presets/config: %s",
+            ", ".join(models),
         )
-    except FileNotFoundError as exc:
-        raise CodexError(f"Failed to launch codex proto: {exc}")
+        return models
 
-    discovered: Optional[str] = None
-    try:
-        assert proc.stdout is not None
-        while True:
-            try:
-                line = await asyncio.wait_for(proc.stdout.readline(), timeout=settings.timeout_seconds)
-            except asyncio.TimeoutError as exc:
-                raise CodexError("codex proto did not emit session_configured in time") from exc
-            if not line:
-                break
-            try:
-                payload = json.loads(line.decode())
-            except json.JSONDecodeError:
-                continue
-            msg = payload.get("msg") if isinstance(payload, dict) else None
-            if isinstance(msg, dict) and msg.get("type") == "session_configured":
-                model = msg.get("model")
-                if isinstance(model, str) and model:
-                    discovered = model
-                break
-    finally:
-        shutdown_payload = json.dumps({"id": "wrapper_shutdown", "op": {"type": "shutdown"}}) + "\n"
-        if proc.stdin is not None:
-            try:
-                proc.stdin.write(shutdown_payload.encode())
-                await proc.stdin.drain()
-            except Exception:
-                pass
-            proc.stdin.close()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-
-    if discovered:
-        return [discovered]
-    return []
+    raise CodexError(
+        "Unable to list Codex models (no builtin presets or config entries found)"
+    )
 
 
 def _dedupe_preserving_order(values: List[str]) -> List[str]:
@@ -690,20 +730,47 @@ def _dedupe_preserving_order(values: List[str]) -> List[str]:
 
 
 def _models_from_config() -> List[str]:
-    """Extract model names from ~/.codex/config.toml as a fallback."""
+    """Extract model names from Codex config files as a fallback."""
 
-    codex_home = (
-        settings.codex_config_dir
-        or os.environ.get("CODEX_HOME")
-        or os.path.expanduser("~/.codex")
-    )
-    config_path = os.path.join(codex_home, "config.toml")
-    if not os.path.isfile(config_path):
-        return []
+    candidates: List[Path] = []
+    errors: List[str] = []
 
-    with open(config_path, "rb") as fh:
-        data = tomllib.load(fh)
+    def _add_candidate(base: Optional[str]) -> None:
+        if not base:
+            return
+        resolved = Path(base).expanduser() / "config.toml"
+        if resolved not in candidates:
+            candidates.append(resolved)
 
+    _add_candidate(settings.codex_config_dir)
+    _add_candidate(os.environ.get("CODEX_HOME"))
+    _add_candidate(str(Path.home() / ".codex"))
+
+    for config_path in candidates:
+        try:
+            with open(config_path, "rb") as fh:
+                data = tomllib.load(fh)
+        except FileNotFoundError:
+            continue
+        except PermissionError as exc:
+            errors.append(f"{config_path}: {exc}")
+            logger.warning("Unable to read Codex config '%s': %s", config_path, exc)
+            continue
+        except Exception as exc:
+            errors.append(f"{config_path}: {exc}")
+            logger.warning("Failed to parse Codex config '%s': %s", config_path, exc)
+            continue
+
+        models = _models_from_config_data(data)
+        if models:
+            return models
+
+    if errors:
+        logger.debug("Skipped Codex config models because: %s", "; ".join(errors))
+    return []
+
+
+def _models_from_config_data(data: Dict[str, Any]) -> List[str]:
     models: List[str] = []
 
     def _add(value: Optional[str]) -> None:
@@ -724,6 +791,55 @@ def _models_from_config() -> List[str]:
             if base:
                 augmented.append(base)
     return _dedupe_preserving_order(augmented)
+
+
+def _classify_codex_failure(stdout_text: str, stderr_text: str) -> Tuple[str, Optional[int]]:
+    """Derive a human-readable error message and optional HTTP status code."""
+
+    def _collect_lines(text: str) -> List[str]:
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
+    lines: List[str] = []
+    if stderr_text:
+        lines.extend(_collect_lines(stderr_text))
+    if stdout_text:
+        lines.extend(_collect_lines(stdout_text))
+
+    message = None
+    for line in reversed(lines):
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                error_obj = data.get("error")
+                if isinstance(error_obj, dict):
+                    error_message = error_obj.get("message")
+                    if isinstance(error_message, str) and error_message.strip():
+                        message = error_message.strip()
+                        break
+                msg = data.get("message")
+                if isinstance(msg, str) and msg.strip():
+                    message = msg.strip()
+                    break
+        lowered = line.lower()
+        if lowered.startswith("error:") or "unauthorized" in lowered or "rate limit" in lowered:
+            message = line
+            break
+    if message is None:
+        message = lines[-1] if lines else "codex execution failed"
+
+    lower_msg = message.lower()
+    status_code = None
+    if "401" in message or "unauthorized" in lower_msg:
+        status_code = 401
+    elif "429" in message or "rate limit" in lower_msg:
+        status_code = 429
+    elif "timeout" in lower_msg:
+        status_code = 504
+
+    return message, status_code
 
 
 async def run_codex(
@@ -758,21 +874,26 @@ async def run_codex(
         except Exception as e:
             raise CodexError(f"Unable to start codex process: {e}")
 
+        raw_lines: List[str] = []
         try:
             while True:
                 line = await proc.stdout.readline()
                 if not line:
                     break
-                filtered = output_filter.process(line.decode(errors="ignore"))
+                decoded = line.decode(errors="ignore")
+                raw_lines.append(decoded)
+                filtered = output_filter.process(decoded.rstrip("\n"))
                 if filtered:
                     yield filtered
             await asyncio.wait_for(proc.wait(), timeout=settings.timeout_seconds)
             if proc.returncode != 0:
-                err = (await proc.stderr.read()).decode().strip()
-                raise CodexError(err or "codex execution failed")
+                stderr_text = (await proc.stderr.read()).decode(errors="ignore")
+                stdout_text = "".join(raw_lines)
+                message, status = _classify_codex_failure(stdout_text, stderr_text)
+                raise CodexError(message, status_code=status)
         except asyncio.TimeoutError:
             proc.kill()
-            raise CodexError("codex execution timed out")
+            raise CodexError("codex execution timed out", status_code=504)
         finally:
             if proc.returncode is None:
                 proc.kill()
@@ -811,8 +932,10 @@ async def run_codex_last_message(
                 proc.communicate(), timeout=settings.timeout_seconds
             )
         if proc.returncode != 0:
-            err = (stderr_data or b"").decode().strip() or "codex execution failed"
-            raise CodexError(err)
+            stdout_text = (stdout_data or b"").decode(errors="ignore")
+            stderr_text = (stderr_data or b"").decode(errors="ignore")
+            message, status = _classify_codex_failure(stdout_text, stderr_text)
+            raise CodexError(message, status_code=status)
         try:
             with open(out_path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
@@ -827,7 +950,7 @@ async def run_codex_last_message(
             return sanitized
         return text.strip()
     except asyncio.TimeoutError:
-        raise CodexError("codex execution timed out")
+        raise CodexError("codex execution timed out", status_code=504)
     finally:
         try:
             os.remove(out_path)

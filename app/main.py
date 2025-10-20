@@ -116,9 +116,14 @@ async def chat_completions(req: ChatCompletionRequest):
             )
             return resp
     except CodexError as e:
+        status = getattr(e, "status_code", None) or 500
         raise HTTPException(
-            status_code=500,
-            detail={"message": str(e), "type": "server_error", "code": None},
+            status_code=status,
+            detail={
+                "message": str(e),
+                "type": "server_error" if status >= 500 else "upstream_error",
+                "code": None,
+            },
         )
     finally:
         for p in image_paths:
@@ -246,9 +251,14 @@ async def responses_endpoint(req: ResponsesRequest):
             )
             return resp
     except CodexError as e:
+        status = getattr(e, "status_code", None) or 500
         raise HTTPException(
-            status_code=500,
-            detail={"message": str(e), "type": "server_error", "code": None},
+            status_code=status,
+            detail={
+                "message": str(e),
+                "type": "server_error" if status >= 500 else "upstream_error",
+                "code": None,
+            },
         )
     finally:
         for p in image_paths:

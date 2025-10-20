@@ -12,10 +12,12 @@ This project loads configuration via environment variables. It supports a `.env`
 
 - `PROXY_API_KEY`: Bearer token required by this proxy (optional if you run without auth).
 - `RATE_LIMIT_PER_MINUTE`: Requests per minute allowed per client. `0` disables limiting.
+- `HOST_UID` / `HOST_GID`: UID/GID assigned to the `codex` user inside the Docker image (default `1000`). Set these to match the host user when bind-mounting `$HOME/.codex` so the container can reuse existing Codex credentials.
 - `CODEX_PATH`: Path to `codex` binary (default: `codex`).
 - `CODEX_WORKDIR`: Working directory for Codex runs (server enforces `cwd` to this path).
   - Codex はこのディレクトリ階層で `AGENTS.md` を探索します。ラッパー API 特有の指示を適用したい場合は、ここ（または配下のサブディレクトリ）に `AGENTS.md` を配置してください。
 - `CODEX_CONFIG_DIR`: Optional directory to use as the Codex CLI home for this wrapper. When set, the server exports `CODEX_HOME` for subprocesses and guarantees the folder exists. Place your API-specific `config.toml` here.
+  - Leave this unset/empty when running in Docker so the container reuses the bind-mounted `${HOME}/.codex` directory.
   - API 専用の `config.toml` や MCP 設定を分離したい場合に利用します（CLI を直接使う環境と分けられます）。
 - `CODEX_WRAPPER_PROFILE_DIR`: Optional path containing `codex_agents.md` / `codex_config.toml` overrides. Defaults to `workspace/codex_profile/` inside the repository. When these files are present the server copies them into the Codex home before startup (legacy filenames `agent.md` / `config.toml` are still accepted with a warning to aid migration).
   - `codex_agents.sample.md` / `codex_config.sample.toml` をコピーして `codex_agents.md` / `codex_config.toml` を用意すると、サーバー起動時に Codex 側のファイルが上書きされます。旧名称を使っている場合は警告を参考にリネームしてください。

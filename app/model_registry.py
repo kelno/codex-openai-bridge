@@ -2,18 +2,25 @@
 
 import logging
 import os
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from .codex import CodexError, apply_codex_profile_overrides, list_codex_models
+from .codex import (
+    CodexError,
+    apply_codex_profile_overrides,
+    builtin_reasoning_aliases,
+    list_codex_models,
+    DEFAULT_CODEX_MODEL,
+)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "codex-cli"
+DEFAULT_MODEL = DEFAULT_CODEX_MODEL
 _AVAILABLE_MODELS: List[str] = [DEFAULT_MODEL]
 _LAST_ERROR: Optional[str] = None
+_REASONING_ALIAS_MAP: Dict[str, Tuple[str, ...]] = {}
 _WARNED_LEGACY_ENV = False
 
-REASONING_EFFORT_SUFFIXES = ("minimal", "low", "medium", "high")
+REASONING_EFFORT_SUFFIXES = ("low", "medium", "high")
 
 
 def _augment_models(models: List[str]) -> List[str]:
@@ -34,9 +41,9 @@ def _augment_models(models: List[str]) -> List[str]:
 
 
 async def initialize_model_registry() -> List[str]:
-    """Populate the available model list by querying the Codex CLI."""
+    """Populate the available model list based on Codex CLI presets."""
 
-    global _AVAILABLE_MODELS, _LAST_ERROR
+    global _AVAILABLE_MODELS, _LAST_ERROR, _REASONING_ALIAS_MAP
 
     _warn_if_legacy_env_present()
     apply_codex_profile_overrides()
@@ -46,6 +53,14 @@ async def initialize_model_registry() -> List[str]:
         if not models:
             raise CodexError("Codex CLI returned an empty model list")
         _AVAILABLE_MODELS = _augment_models(models)
+        alias_map = builtin_reasoning_aliases()
+        _REASONING_ALIAS_MAP = {
+            model: tuple(efforts)
+            for model, efforts in alias_map.items()
+            if efforts and model in _AVAILABLE_MODELS
+        }
+        if not _REASONING_ALIAS_MAP and "gpt-5" in _AVAILABLE_MODELS:
+            _REASONING_ALIAS_MAP = {"gpt-5": tuple(REASONING_EFFORT_SUFFIXES)}
         _LAST_ERROR = None
         logger.info("Loaded %d Codex model(s): %s", len(models), ", ".join(models))
     except Exception as exc:  # pragma: no cover - startup failure path
@@ -54,7 +69,12 @@ async def initialize_model_registry() -> List[str]:
             "Falling back to default model list because Codex model discovery failed: %s",
             exc,
         )
-        _AVAILABLE_MODELS = _augment_models([DEFAULT_MODEL])
+        fallback_models = [DEFAULT_MODEL, "gpt-5"]
+        _AVAILABLE_MODELS = _augment_models(fallback_models)
+        _REASONING_ALIAS_MAP = {
+            "gpt-5": tuple(REASONING_EFFORT_SUFFIXES),
+            DEFAULT_MODEL: tuple(REASONING_EFFORT_SUFFIXES),
+        }
     return list(_AVAILABLE_MODELS)
 
 
@@ -63,11 +83,12 @@ def get_available_models(include_reasoning_aliases: bool = False) -> List[str]:
 
     models = list(_AVAILABLE_MODELS)
     if include_reasoning_aliases and _AVAILABLE_MODELS:
-        alias: List[str] = []
-        for base in _AVAILABLE_MODELS:
-            alias.extend(f"{base} {suffix}" for suffix in REASONING_EFFORT_SUFFIXES)
-        models.extend(alias)
-    return models
+        for base, suffixes in _REASONING_ALIAS_MAP.items():
+            if base not in models:
+                continue
+            models.extend(f"{base} {suffix}" for suffix in suffixes)
+    # Preserve ordering while removing duplicates
+    return list(dict.fromkeys(models))
 
 
 def get_default_model() -> str:
@@ -102,8 +123,13 @@ def _split_model_and_effort(raw: str) -> Tuple[str, Optional[str]]:
         return normalized, None
     if " " in normalized:
         base, suffix = normalized.rsplit(" ", 1)
-        if base and suffix.lower() in REASONING_EFFORT_SUFFIXES:
-            return base, suffix.lower()
+        suffix_lower = suffix.lower()
+        supported_suffixes = _REASONING_ALIAS_MAP.get(base)
+        if base and suffix_lower in REASONING_EFFORT_SUFFIXES:
+            if supported_suffixes and suffix_lower in supported_suffixes:
+                return base, suffix_lower
+            if supported_suffixes is None and base == "gpt-5":
+                return base, suffix_lower
     return normalized, None
 
 
