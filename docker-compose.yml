@@ -15,7 +15,7 @@ services:
       CODEX_WORKDIR: /workspace
       CODEX_PATH: codex
     ports:
-      - "8000:8000"
+      - "8020:8000"
     volumes:
       - ${HOME}/.codex:/home/codex/.codex
       - codex-workspace:/workspace
