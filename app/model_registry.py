@@ -20,7 +20,7 @@ _LAST_ERROR: Optional[str] = None
 _REASONING_ALIAS_MAP: Dict[str, Tuple[str, ...]] = {}
 _WARNED_LEGACY_ENV = False
 
-REASONING_EFFORT_SUFFIXES = ("low", "medium", "high")
+REASONING_EFFORT_SUFFIXES = ("low", "medium", "high", "xhigh")
 
 
 def _augment_models(models: List[str]) -> List[str]:
@@ -69,10 +69,11 @@ async def initialize_model_registry() -> List[str]:
             "Falling back to default model list because Codex model discovery failed: %s",
             exc,
         )
-        fallback_models = [DEFAULT_MODEL, "gpt-5"]
+        fallback_models = [DEFAULT_MODEL, "gpt-5.1", "gpt-5"]
         _AVAILABLE_MODELS = _augment_models(fallback_models)
         _REASONING_ALIAS_MAP = {
             "gpt-5": tuple(REASONING_EFFORT_SUFFIXES),
+            "gpt-5.1": tuple(REASONING_EFFORT_SUFFIXES),
             DEFAULT_MODEL: tuple(REASONING_EFFORT_SUFFIXES),
         }
     return list(_AVAILABLE_MODELS)

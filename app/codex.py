@@ -31,10 +31,10 @@ class CodexError(Exception):
 logger = logging.getLogger(__name__)
 
 DEFAULT_CODEX_MODEL = "codex-cli"
-_FALLBACK_MODELS = (DEFAULT_CODEX_MODEL,)
+_FALLBACK_MODELS = (DEFAULT_CODEX_MODEL, "gpt-5.1")
 _SKIP_PRESET_PREFIXES = ("swiftfox",)
 _DEFAULT_REASONING_EFFORTS = ("low", "medium", "high")
-_ALLOWED_REASONING_EFFORTS = set(_DEFAULT_REASONING_EFFORTS)
+_ALLOWED_REASONING_EFFORTS = set((*_DEFAULT_REASONING_EFFORTS, "xhigh"))
 
 _DEFAULT_PROFILE_DIR = (
     Path(__file__).resolve().parent.parent / "workspace" / "codex_profile"
@@ -627,8 +627,9 @@ def load_builtin_model_presets() -> List[ModelPresetEntry]:
         / "submodules"
         / "codex"
         / "codex-rs"
-        / "common"
+        / "core"
         / "src"
+        / "openai_models"
         / "model_presets.rs"
     )
 
@@ -641,13 +642,40 @@ def load_builtin_model_presets() -> List[ModelPresetEntry]:
         logger.warning("Failed to read Codex model presets from %s: %s", preset_path, exc)
         return []
 
-    block_pattern = re.compile(r"ModelPreset\s*{([^}]*)}", re.DOTALL)
     model_pattern = re.compile(r'model:\s*"([^"]+)"')
-    effort_pattern = re.compile(r'effort:\s*Some\(ReasoningEffort::([A-Za-z]+)\)')
+    effort_pattern = re.compile(
+        r"effort:\s*(?:Some\()?\s*ReasoningEffort::([A-Za-z]+)\)?"
+    )
+
+    def _extract_preset_blocks(text: str) -> List[str]:
+        blocks: List[str] = []
+        idx = 0
+        while True:
+            start = text.find("ModelPreset", idx)
+            if start == -1:
+                break
+            brace = text.find("{", start)
+            if brace == -1:
+                break
+            depth = 0
+            i = brace
+            while i < len(text):
+                ch = text[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        blocks.append(text[brace + 1 : i])
+                        idx = i + 1
+                        break
+                i += 1
+            else:
+                break
+        return blocks
 
     presets: List[ModelPresetEntry] = []
-    for match in block_pattern.finditer(raw):
-        block = match.group(1)
+    for block in _extract_preset_blocks(raw):
         model_match = model_pattern.search(block)
         if not model_match:
             continue
@@ -656,9 +684,12 @@ def load_builtin_model_presets() -> List[ModelPresetEntry]:
             continue
         if any(model.startswith(prefix) for prefix in _SKIP_PRESET_PREFIXES):
             continue
-        effort_match = effort_pattern.search(block)
-        effort = effort_match.group(1).lower() if effort_match else None
-        presets.append(ModelPresetEntry(model=model, effort=effort))
+        effort_matches = [m.lower() for m in effort_pattern.findall(block)]
+        if not effort_matches:
+            presets.append(ModelPresetEntry(model=model, effort=None))
+            continue
+        for effort in effort_matches:
+            presets.append(ModelPresetEntry(model=model, effort=effort))
 
     if not presets:
         logger.warning("Parsed zero Codex model presets from %s", preset_path)
@@ -727,6 +758,66 @@ def _dedupe_preserving_order(values: List[str]) -> List[str]:
         seen.add(value)
         result.append(value)
     return result
+
+
+def _parse_model_listing(raw: str) -> List[str]:
+    """Parse `codex models list` output (JSON or plaintext) into model IDs."""
+
+    models: List[str] = []
+    if not raw:
+        return models
+
+    # Prefer JSON payloads first.
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = None
+
+    if isinstance(data, dict) and isinstance(data.get("data"), list):
+        for entry in data["data"]:
+            if not isinstance(entry, dict):
+                continue
+            model_id = entry.get("id")
+            if not isinstance(model_id, str) or not model_id.strip():
+                continue
+            model_id = model_id.strip()
+
+            deployments = entry.get("deployments") or entry.get("deployment")
+            if isinstance(deployments, str):
+                deployments = [deployments]
+            deployments = deployments if isinstance(deployments, list) else []
+
+            variants = entry.get("variants") if isinstance(entry.get("variants"), list) else []
+
+            is_codex = any(isinstance(d, str) and d.strip() == "codex" for d in deployments)
+            models.append(model_id)
+            if is_codex and not model_id.endswith("-codex"):
+                models.append(f"{model_id}-codex")
+
+            for variant in variants:
+                if isinstance(variant, dict):
+                    variant_id = variant.get("id")
+                else:
+                    variant_id = None
+                if isinstance(variant_id, str) and variant_id.strip():
+                    models.append(f"{model_id}-{variant_id.strip()}")
+
+        return _dedupe_preserving_order(models)
+
+    # Fallback: plaintext listing.
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("available models"):
+            continue
+        parts = stripped.split()
+        base = parts[0]
+        is_codex = any(p.lower() == "codex" for p in parts[1:])
+        if is_codex and not base.endswith("-codex"):
+            models.append(f"{base}-codex")
+        else:
+            models.append(base)
+
+    return _dedupe_preserving_order(models)
 
 
 def _models_from_config() -> List[str]:
