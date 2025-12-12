@@ -40,6 +40,29 @@ def _augment_models(models: List[str]) -> List[str]:
     return augmented
 
 
+def _default_reasoning_aliases_for_model(model: str) -> Optional[Tuple[str, ...]]:
+    """Return default reasoning effort aliases for well-known model families."""
+
+    if model.startswith("gpt-5"):
+        return tuple(REASONING_EFFORT_SUFFIXES)
+    return None
+
+
+def _merge_default_reasoning_aliases(
+    models: List[str], alias_map: Dict[str, Tuple[str, ...]]
+) -> Dict[str, Tuple[str, ...]]:
+    """Ensure models that support reasoning expose aliases even when presets omit them."""
+
+    merged: Dict[str, Tuple[str, ...]] = {k: tuple(v) for k, v in alias_map.items() if v}
+    for model in models:
+        if model in merged:
+            continue
+        defaults = _default_reasoning_aliases_for_model(model)
+        if defaults:
+            merged[model] = defaults
+    return merged
+
+
 async def initialize_model_registry() -> List[str]:
     """Populate the available model list based on Codex CLI presets."""
 
@@ -53,7 +76,7 @@ async def initialize_model_registry() -> List[str]:
         if not models:
             raise CodexError("Codex CLI returned an empty model list")
         _AVAILABLE_MODELS = _augment_models(models)
-        alias_map = builtin_reasoning_aliases()
+        alias_map = _merge_default_reasoning_aliases(_AVAILABLE_MODELS, builtin_reasoning_aliases())
         _REASONING_ALIAS_MAP = {
             model: tuple(efforts)
             for model, efforts in alias_map.items()
@@ -71,11 +94,11 @@ async def initialize_model_registry() -> List[str]:
         )
         fallback_models = [DEFAULT_MODEL, "gpt-5.1", "gpt-5"]
         _AVAILABLE_MODELS = _augment_models(fallback_models)
-        _REASONING_ALIAS_MAP = {
+        fallback_aliases = {
             "gpt-5": tuple(REASONING_EFFORT_SUFFIXES),
-            "gpt-5.1": tuple(REASONING_EFFORT_SUFFIXES),
             DEFAULT_MODEL: tuple(REASONING_EFFORT_SUFFIXES),
         }
+        _REASONING_ALIAS_MAP = _merge_default_reasoning_aliases(_AVAILABLE_MODELS, fallback_aliases)
     return list(_AVAILABLE_MODELS)
 
 
@@ -129,7 +152,8 @@ def _split_model_and_effort(raw: str) -> Tuple[str, Optional[str]]:
         if base and suffix_lower in REASONING_EFFORT_SUFFIXES:
             if supported_suffixes and suffix_lower in supported_suffixes:
                 return base, suffix_lower
-            if supported_suffixes is None and base == "gpt-5":
+            defaults = _default_reasoning_aliases_for_model(base)
+            if defaults and suffix_lower in defaults:
                 return base, suffix_lower
     return normalized, None
 

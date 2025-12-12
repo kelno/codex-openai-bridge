@@ -490,7 +490,10 @@ def apply_codex_profile_overrides() -> None:
 def _build_codex_env() -> Dict[str, str]:
     """Prepare environment variables for Codex subprocesses."""
 
+    codex_home = _resolve_codex_home_dir()
     env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+
     config_dir = settings.codex_config_dir
     if config_dir:
         try:
