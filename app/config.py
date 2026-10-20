@@ -32,7 +32,8 @@ class Settings(BaseSettings):
     max_parallel_requests: int = Field(default=8, alias="CODEX_MAX_PARALLEL_REQUESTS")
     # Pre-started threads kept per system prompt, so requests skip thread start and
     # Codex's per-thread setup before the first turn (~0.6-1 s).
-    idle_threads: int = Field(default=2, alias="CODEX_IDLE_THREADS")
+    # Default matches max_parallel_requests so a full burst finds spares.
+    idle_threads: int = Field(default=8, alias="CODEX_IDLE_THREADS")
     # Start the app-server with plugins, MCP servers, hooks, tools and injected
     # agent instructions turned off.
     lean: bool = Field(default=True, alias="CODEX_LEAN")

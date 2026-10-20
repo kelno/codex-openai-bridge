@@ -8,7 +8,7 @@ A FastAPI server that puts an OpenAI-compatible API in front of the [Codex CLI](
 
 ## How requests are served
 
-The server keeps one `codex app-server` process running and gives every request its own short-lived (ephemeral) Codex thread on it. Requests run in parallel (up to `CODEX_MAX_PARALLEL_REQUESTS`, default 8) and their streams never mix. A thread's system prompt is fixed when it starts, but the model and effort are chosen per turn, so the server keeps a few pre-started spare threads for each recently used system prompt (`CODEX_IDLE_THREADS`, default 2). A request whose system prompt has a spare skips thread start and the per-thread setup Codex does before its first turn, which saves about 0.6–1 s. Spares are never reused: each one serves exactly one request and is then replaced in the background.
+The server keeps one `codex app-server` process running and gives every request its own short-lived (ephemeral) Codex thread on it. Requests run in parallel (up to `CODEX_MAX_PARALLEL_REQUESTS`, default 8) and their streams never mix. A thread's system prompt is fixed when it starts, but the model and effort are chosen per turn, so the server keeps a few pre-started spare threads for each recently used system prompt (`CODEX_IDLE_THREADS`, default 8, enough for a full burst). A request whose system prompt has a spare skips thread start and the per-thread setup Codex does before its first turn, which saves about 0.6–1 s. Spares are never reused: each one serves exactly one request and is then replaced in the background.
 
 The app-server is started with a lean profile: plugins, MCP servers, hooks, shell/browser/computer-use tools, skills and the injected sandbox/environment instructions are turned off, and the client's `system` message replaces Codex's agent prompt. A tiny request costs about 2.3k input tokens instead of about 13k.
 
@@ -89,7 +89,7 @@ All settings are environment variables (a `.env` file is loaded automatically). 
 |---|---|---|
 | `CODEX_LEAN` | `true` | Disable plugins, MCP servers, hooks, tools and injected instructions in the app-server |
 | `CODEX_MAX_PARALLEL_REQUESTS` | `8` | Concurrent Codex turns |
-| `CODEX_IDLE_THREADS` | `2` | Pre-started spare threads per system prompt (`0` disables) |
+| `CODEX_IDLE_THREADS` | `8` | Pre-started spare threads per system prompt (`0` disables) |
 | `CODEX_TIMEOUT` | `120` | Seconds per request |
 | `PROXY_API_KEY` | unset | Require `Authorization: Bearer <key>` |
 | `RATE_LIMIT_PER_MINUTE` | `0` (off) | Requests per minute per client IP |

@@ -34,6 +34,7 @@ def backend_log(monkeypatch, tmp_path):
     monkeypatch.setenv("FAKE_APP_SERVER_LOG", str(log_path))
     monkeypatch.setattr(settings, "codex_workdir", str(tmp_path / "work"))
     monkeypatch.setattr(settings, "timeout_seconds", 10)
+    monkeypatch.setattr(settings, "idle_threads", 2)  # the pool tests count thread starts
     monkeypatch.setattr(main.codex, "_command_factory", lambda: FAKE_COMMAND)
 
     def requests(method):
