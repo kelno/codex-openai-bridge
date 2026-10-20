@@ -1,8 +1,23 @@
 import os
+from pathlib import Path
 from typing import Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_codex_workdir() -> str:
+    """Return the platform-appropriate default Codex working directory.
+
+    On Windows a root-relative path such as ``/workspace`` resolves against the
+    current drive (e.g. ``E:/workspace``), so default to a per-user location
+    instead. POSIX keeps ``/workspace`` to match the Docker image layout.
+    """
+
+    if os.name == "nt":
+        base = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return str(Path(base) / "codex-wrapper" / "workspace")
+    return "/workspace"
 
 
 class Settings(BaseSettings):
@@ -12,7 +27,9 @@ class Settings(BaseSettings):
     # Docker ビルドで使用するホスト UID/GID。アプリ本体では未使用だが、.env の互換性維持のため受理する。
     host_uid: Optional[int] = Field(default=None, alias="HOST_UID")
     host_gid: Optional[int] = Field(default=None, alias="HOST_GID")
-    codex_workdir: str = Field(default="/workspace", alias="CODEX_WORKDIR")
+    codex_workdir: str = Field(
+        default_factory=_default_codex_workdir, alias="CODEX_WORKDIR"
+    )
     codex_config_dir: Optional[str] = Field(default=None, alias="CODEX_CONFIG_DIR")
     codex_profile_dir: Optional[str] = Field(
         default=None, alias="CODEX_WRAPPER_PROFILE_DIR"

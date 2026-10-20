@@ -76,7 +76,7 @@ cp docs/examples/AGENTS.example.md AGENTS.md
 cp docs/examples/AGENTS.example.md "$CODEX_WORKDIR/AGENTS.md"
 ```
 
-`CODEX_WORKDIR`（既定 `/workspace`）を設定すると、ラッパーはそのディレクトリ階層に存在する `AGENTS.md` を Codex へ連結します。プロジェクト固有の運用ルールを共有したいときに活用してください。
+`CODEX_WORKDIR`（既定: Linux/macOS は `/workspace`、Windows は `%LOCALAPPDATA%\codex-wrapper\workspace`）を設定すると、ラッパーはそのディレクトリ階層に存在する `AGENTS.md` を Codex へ連結します。プロジェクト固有の運用ルールを共有したいときに活用してください。
 
 4c) ラッパーのプロファイル上書き（任意）
 
@@ -174,7 +174,8 @@ Structured output（`response_format` や JSON Schema）には Codex CLI が文�
 - PROXY_API_KEY: ラッパー用の API トークン。未設定の場合は認証なしで起動します。
 - RATE_LIMIT_PER_MINUTE: 1 分あたりのリクエスト許容量。0 を指定するとレート制限を無効化します。
 - CODEX_PATH: `codex` バイナリのパス。既定値は `codex`。
-- CODEX_WORKDIR: Codex 実行時の作業ディレクトリ (`cwd`)。既定値は `/workspace`。
+- CODEX_WORKDIR: Codex 実行時の作業ディレクトリ (`cwd`)。既定値は Linux/macOS (Docker) では `/workspace`、Windows では `%LOCALAPPDATA%\codex-wrapper\workspace`。
+  - Windows ではドライブレター付きの絶対パスを指定してください。`/workspace` は現在のドライブのルート（例: `E:\workspace`）に解決されます。
   - サーバープロセスから書き込み可能なパスでなければ、`Failed to create CODEX_WORKDIR ... Read-only file system` エラーになります。
   - この階層（およびサブディレクトリ）に置いた `AGENTS.md` は Codex が連結するため、`docs/examples/AGENTS.example.md` をコピーしてラッパー専用の指示を記載できます。
 - CODEX_CONFIG_DIR: ラッパー専用の Codex 設定ディレクトリ（任意）。設定するとサーバーが存在確認と作成を行い、Codex CLI をこのディレクトリを `CODEX_HOME` として実行します。`config.toml` や MCP 設定、専用の `auth.json` を分離したい場合に利用します。

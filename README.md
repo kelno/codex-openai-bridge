@@ -76,7 +76,7 @@ cp docs/examples/AGENTS.example.md AGENTS.md
 cp docs/examples/AGENTS.example.md $CODEX_WORKDIR/AGENTS.md
 ```
 
-With `CODEX_WORKDIR` set (default `/workspace`), Codex merges any `AGENTS.md` files under that directory hierarchy when the wrapper executes requests.
+With `CODEX_WORKDIR` set (default `/workspace` on Linux/macOS, `%LOCALAPPDATA%\codex-wrapper\workspace` on Windows), Codex merges any `AGENTS.md` files under that directory hierarchy when the wrapper executes requests.
 
 4c) Optional: Wrapper bootstrap profile overrides
 
@@ -170,7 +170,8 @@ This server reads `.env` and uses the following variables. Example values and co
 - PROXY_API_KEY: API token for this wrapper. If unset, the server can run without auth.
 - RATE_LIMIT_PER_MINUTE: Allowed requests per minute. 0 disables limiting.
 - CODEX_PATH: Path to the `codex` binary. Default `codex`.
-- CODEX_WORKDIR: Working directory for Codex executions (`cwd`). Default `/workspace`.
+- CODEX_WORKDIR: Working directory for Codex executions (`cwd`). Default `/workspace` on Linux/macOS (Docker) and `%LOCALAPPDATA%\codex-wrapper\workspace` on Windows.
+  - On Windows, use an absolute path with a drive letter; `/workspace` resolves to the root of the current drive (e.g. `E:\workspace`).
   - Ensure this directory is writable by the server user; otherwise Codex fails with `Failed to create CODEX_WORKDIR ... Read-only file system`.
   - Codex merges any `AGENTS.md` files under this directory tree when the wrapper runs requests; copy `docs/examples/AGENTS.example.md` here (or deeper) to provide project instructions.
 - CODEX_CONFIG_DIR: Optional directory treated as `CODEX_HOME` for this wrapper. When set, the server creates it if missing and runs Codex CLI with that directory as its config root; place wrapper-specific `config.toml`, `auth.json`, or MCP settings here.

@@ -14,7 +14,7 @@ This project loads configuration via environment variables. It supports a `.env`
 - `RATE_LIMIT_PER_MINUTE`: Requests per minute allowed per client. `0` disables limiting.
 - `HOST_UID` / `HOST_GID`: UID/GID assigned to the `codex` user inside the Docker image (default `1000`). Set these to match the host user when bind-mounting `$HOME/.codex` so the container can reuse existing Codex credentials.
 - `CODEX_PATH`: Path to `codex` binary (default: `codex`).
-- `CODEX_WORKDIR`: Working directory for Codex runs (server enforces `cwd` to this path).
+- `CODEX_WORKDIR`: Working directory for Codex runs (server enforces `cwd` to this path). Default: `/workspace` on Linux/macOS (Docker), `%LOCALAPPDATA%\codex-wrapper\workspace` on Windows. On Windows, always use an absolute path with a drive letter — `/workspace` resolves to the root of the current drive (e.g. `E:\workspace`) and the server logs a warning.
   - Codex はこのディレクトリ階層で `AGENTS.md` を探索します。ラッパー API 特有の指示を適用したい場合は、ここ（または配下のサブディレクトリ）に `AGENTS.md` を配置してください。
 - `CODEX_CONFIG_DIR`: Optional directory to use as the Codex CLI home for this wrapper. When set, the server exports `CODEX_HOME` for subprocesses and guarantees the folder exists. Place your API-specific `config.toml` here.
   - Leave this unset/empty when running in Docker so the container reuses the bind-mounted `${HOME}/.codex` directory.

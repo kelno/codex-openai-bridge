@@ -279,6 +279,13 @@ def _ensure_workdir_exists() -> None:
             return
 
         requested_path = Path(settings.codex_workdir).expanduser()
+        if os.name == "nt" and requested_path.root and not requested_path.drive:
+            logger.warning(
+                "CODEX_WORKDIR '%s' has no drive letter and resolves to '%s' on the "
+                "current drive; set an absolute path such as 'C:\\path\\to\\workdir'",
+                settings.codex_workdir,
+                requested_path.resolve(),
+            )
         candidates: list[Path] = [requested_path]
 
         fallback_candidates = [
