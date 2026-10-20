@@ -1,0 +1,27 @@
+[project]
+name = "codex-wrapper"
+version = "0.2.0"
+description = "OpenAI-compatible API (chat completions, responses) served through the Codex CLI"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.15.1",
+    "pytest>=8",
+]
+
+[tool.uv]
+# The app is run from the source tree (`uv run uvicorn app.main:app`), not installed as a package.
+package = false
+
+[tool.pytest.ini_options]
+norecursedirs = ["workspace", "submodules"]
+pythonpath = ["."]

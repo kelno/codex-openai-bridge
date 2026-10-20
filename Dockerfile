@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
 
-FROM python:3.11-slim AS runtime
+FROM python:3.12-slim AS runtime
+
+COPY --from=ghcr.io/astral-sh/uv:0.12.10 /uv /uvx /bin/
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
 
 ARG CODEX_UID=1000
 ARG CODEX_GID=1000
@@ -24,8 +27,9 @@ RUN groupadd --gid "${CODEX_GID}" codex \
 WORKDIR /app
 
 # Install Python dependencies first for better layer caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock .python-version ./
+RUN uv sync --frozen --no-dev --no-install-project
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Copy the rest of the project source
 COPY . /app
