@@ -35,6 +35,7 @@ def backend_log(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "codex_workdir", str(tmp_path / "work"))
     monkeypatch.setattr(settings, "timeout_seconds", 10)
     monkeypatch.setattr(settings, "idle_threads", 2)  # the pool tests count thread starts
+    main._REJECTED_SCHEMAS.clear()
     monkeypatch.setattr(main.codex, "_command_factory", lambda: FAKE_COMMAND)
 
     def requests(method):
@@ -131,6 +132,65 @@ def test_json_schema_response_format_is_forwarded(client, backend_log):
     turn = backend_log("turn/start")[0]
     assert turn["outputSchema"] == SCHEMA
     assert turn["effort"] == "low"
+
+
+LOOSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "place": {"type": "string"}},
+                "required": ["name"],
+            },
+        }
+    },
+    "required": ["items"],
+}
+
+
+def test_non_strict_schema_is_described_in_instructions(client, backend_log):
+    # OpenAI's default is strict=false: best effort, any schema accepted.
+    resp = _chat(client, "list", response_format={"type": "json_schema", "json_schema": {"name": "x", "schema": LOOSE_SCHEMA}})
+    assert resp.status_code == 200
+    assert "outputSchema" not in backend_log("turn/start")[0]
+    instructions = backend_log("thread/start")[0]["baseInstructions"]
+    assert "matches this JSON Schema" in instructions and '"place"' in instructions
+
+
+def test_strict_schema_rejected_by_backend_falls_back_and_is_remembered(client, backend_log):
+    fmt = {"type": "json_schema", "json_schema": {"name": "x", "schema": LOOSE_SCHEMA, "strict": True}}
+    resp = _chat(client, "list", response_format=fmt)
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "echo:list"
+    first, retry = backend_log("turn/start")
+    assert first["outputSchema"] == LOOSE_SCHEMA and "outputSchema" not in retry
+    threads = {t["_threadId"]: t for t in backend_log("thread/start")}
+    assert '"place"' in threads[retry["threadId"]]["baseInstructions"]
+
+    # The rejection is remembered: the next request goes straight to the fallback.
+    assert _chat(client, "again", response_format=fmt, stream=True).status_code == 200
+    assert "outputSchema" not in backend_log("turn/start")[2]
+    assert len(backend_log("turn/start")) == 3
+
+
+def test_strict_schema_fallback_also_works_when_streaming(client):
+    fmt = {"type": "json_schema", "json_schema": {"name": "x", "schema": LOOSE_SCHEMA, "strict": True}}
+    resp = _chat(client, "list", response_format=fmt, stream=True)
+    assert resp.status_code == 200
+    text = "".join(c["choices"][0]["delta"].get("content", "") for c in _sse_chunks(resp.text) if c["choices"])
+    assert text == "echo:list"
+
+
+def test_openai_request_errors_map_to_400_with_code(client):
+    resp = _chat(client, "BADREQ")
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == {
+        "message": "Something about the request is invalid.",
+        "type": "invalid_request_error",
+        "code": "invalid_value",
+    }
 
 
 def test_json_object_mode_adds_instruction(client, backend_log):

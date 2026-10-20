@@ -68,7 +68,10 @@ Accepted request fields:
 - `model`, `messages` (`system`/`developer`/`user`/`assistant`/`tool`; text and image parts)
 - `stream`, `stream_options.include_usage`
 - `reasoning_effort` (`none`/`minimal` map to the lowest effort the model supports)
-- `response_format`: `{"type": "json_schema", "json_schema": {"name", "schema", "strict"}}` constrains the answer to the schema; `{"type": "json_object"}` asks for a JSON object
+- `response_format`, with the same `strict` default as OpenAI (off):
+  - `{"type": "json_schema", "json_schema": {"name", "schema", "strict": true}}`: the schema is enforced by OpenAI's structured outputs. It must follow OpenAI's strict-mode rules: every object lists all of its properties in `required` (use `"type": ["string", "null"]` for optional values) and sets `"additionalProperties": false`. If OpenAI rejects the schema, the server logs a warning, retries once with the schema described in the instructions instead, and remembers that schema so later requests skip the failed attempt.
+  - `json_schema` without `strict: true`: the schema is described in the instructions (best effort, any schema accepted).
+  - `{"type": "json_object"}`: asks for a single JSON object.
 - `temperature`, `max_tokens`: accepted and ignored
 
 Responses carry a unique `id` (`chatcmpl-...`), `created`, `model` and, when the backend reports it, `usage` with `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`. If usage is unavailable the field is omitted rather than zero-filled. Streams follow the OpenAI chunk format (role chunk, content deltas, a final `finish_reason: "stop"` chunk, an optional usage chunk, then `data: [DONE]`).

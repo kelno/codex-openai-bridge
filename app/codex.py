@@ -91,11 +91,16 @@ _OPT_OUT_NOTIFICATIONS = [
 
 
 class CodexError(Exception):
-    """A Codex failure, with the HTTP status the API should report."""
+    """A Codex failure, with the HTTP status the API should report.
 
-    def __init__(self, message: str, *, status_code: int = 502) -> None:
+    ``code`` carries OpenAI's error code when the model backend rejected the
+    request (for example ``invalid_json_schema``).
+    """
+
+    def __init__(self, message: str, *, status_code: int = 502, code: Optional[str] = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
 
 
 @dataclass
@@ -186,13 +191,32 @@ def warn_if_global_agents_md() -> None:
             )
 
 
-def _turn_error_status(error: Dict[str, Any]) -> int:
+def _turn_error(error: Dict[str, Any], status: Optional[str]) -> CodexError:
+    """Build a CodexError from a failed turn's ``TurnError``.
+
+    When the model backend rejected the request, Codex puts OpenAI's error JSON
+    in ``message``; unwrap it so clients see OpenAI's message and code.
+    """
+
+    message = error.get("message") or f"turn {status}"
+    code = err_type = None
+    with suppress(ValueError, TypeError, AttributeError):
+        inner = json.loads(message)
+        inner_error = inner.get("error") if isinstance(inner, dict) else None
+        if isinstance(inner_error, dict):
+            message = inner_error.get("message") or message
+            code = inner_error.get("code")
+            err_type = inner_error.get("type")
     blob = json.dumps(error).lower()
-    if "unauthorized" in blob or "401" in blob:
-        return 401
-    if "usagelimit" in blob or "usage_limit" in blob or "rate limit" in blob or "429" in blob:
-        return 429
-    return 502
+    if err_type == "invalid_request_error":
+        status_code = 400
+    elif "unauthorized" in blob or "401" in blob:
+        status_code = 401
+    elif "usagelimit" in blob or "usage_limit" in blob or "rate limit" in blob or "429" in blob:
+        status_code = 429
+    else:
+        status_code = 502
+    return CodexError(message, status_code=status_code, code=code)
 
 
 class _Limiter:
@@ -614,9 +638,7 @@ class AppServerClient:
                         completed = True
                         turn_obj = p.get("turn") or {}
                         if turn_obj.get("status") != "completed":
-                            error = turn_obj.get("error") or {}
-                            message = error.get("message") or f"turn {turn_obj.get('status')}"
-                            raise CodexError(message, status_code=_turn_error_status(error))
+                            raise _turn_error(turn_obj.get("error") or {}, turn_obj.get("status"))
                         break
                     elif method == "_closed":
                         completed = True

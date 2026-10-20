@@ -5,8 +5,10 @@ Speaks newline-delimited JSON-RPC on stdio. Each turn answers with
 streamed in a few deltas, so concurrent turns interleave. Every request's
 params are appended to $FAKE_APP_SERVER_LOG as JSON lines.
 
-Input text containing FAIL makes the turn fail with a usage-limit error, and
-NOUSAGE skips the token usage notification.
+Input text containing FAIL makes the turn fail with a usage-limit error,
+BADREQ makes it fail with an OpenAI invalid_request_error, and NOUSAGE skips the
+token usage notification. Like OpenAI's strict mode, an outputSchema whose
+objects do not list every property in `required` is rejected.
 """
 
 import json
@@ -33,9 +35,42 @@ def log(method, params):
             fh.write(json.dumps({"method": method, "params": params}) + "\n")
 
 
+def strict_schema_problem(schema, path="schema"):
+    if isinstance(schema, dict):
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            missing = [k for k in props if k not in (schema.get("required") or [])]
+            if missing:
+                return f"'{path}.required' is required to include every key in properties. Missing '{missing[0]}'."
+            for key, sub in props.items():
+                problem = strict_schema_problem(sub, f"{path}.properties.{key}")
+                if problem:
+                    return problem
+        if "items" in schema:
+            return strict_schema_problem(schema["items"], f"{path}.items")
+    return None
+
+
+def fail_openai(thread_id, turn_id, message, code):
+    inner = {"type": "error", "status": 400, "error": {
+        "message": message, "type": "invalid_request_error", "param": "text.format.schema", "code": code}}
+    error = {"message": json.dumps(inner), "codexErrorInfo": "other"}
+    send({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "error": error, "willRetry": False}})
+    send({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {
+        "id": turn_id, "status": "failed", "error": error}}})
+
+
 def run_turn(thread_id, turn_id, params):
     text = "".join(i.get("text", "") for i in params.get("input", []) if i.get("type") == "text")
     send({"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": turn_id}}})
+    problem = strict_schema_problem(params["outputSchema"]) if params.get("outputSchema") else None
+    if problem:
+        fail_openai(thread_id, turn_id, f"Invalid schema for response_format 'codex_output_schema': {problem}",
+                    "invalid_json_schema")
+        return
+    if "BADREQ" in text:
+        fail_openai(thread_id, turn_id, "Something about the request is invalid.", "invalid_value")
+        return
     if "FAIL" in text:
         send({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {
             "id": turn_id, "status": "failed",

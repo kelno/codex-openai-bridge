@@ -1,12 +1,14 @@
 import asyncio
+import hashlib
 import json
 import logging
 import logging.config
 import os
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -47,6 +49,15 @@ logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger("app.main")
 
 JSON_MODE_HINT = "Respond with a single valid JSON object and nothing else (no prose, no code fences)."
+SCHEMA_HINT = (
+    "Respond with a single JSON value that matches this JSON Schema, and nothing else "
+    "(no prose, no code fences):\n{schema}"
+)
+
+# Schemas the model backend refused as strict output schemas (by hash); requests with
+# them go straight to the instruction-based fallback instead of failing first.
+_REJECTED_SCHEMAS: "OrderedDict[str, None]" = OrderedDict()
+_REJECTED_SCHEMAS_MAX = 256
 
 
 async def _warm_codex() -> None:
@@ -89,6 +100,19 @@ class _Job:
     images: List[str] = field(default_factory=list)
     temp_files: List[str] = field(default_factory=list)
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    # Instructions to retry with if the backend rejects output_schema as a strict schema.
+    schema_fallback: Optional[str] = None
+
+    def without_schema(self) -> "_Job":
+        """The same job with the schema moved from enforcement into the instructions."""
+
+        _REJECTED_SCHEMAS[_schema_key(self.output_schema)] = None
+        while len(_REJECTED_SCHEMAS) > _REJECTED_SCHEMAS_MAX:
+            _REJECTED_SCHEMAS.popitem(last=False)
+        return replace(self, instructions=self.schema_fallback, output_schema=None, schema_fallback=None)
+
+    def can_fall_back(self, error: CodexError) -> bool:
+        return error.code == "invalid_json_schema" and self.schema_fallback is not None
 
     def stream(self, result: TurnResult) -> AsyncIterator[str]:
         return codex.run_turn(
@@ -132,16 +156,29 @@ async def _build_job(
             status_code=404,
             detail={"message": str(e), "type": "invalid_request_error", "code": "model_not_found"},
         )
-    output_schema, json_mode = _parse_response_format(response_format)
+    schema, strict, json_mode = _parse_response_format(response_format)
     instructions, text, image_urls = split_messages(messages)
     if json_mode:
         instructions = f"{instructions or DEFAULT_INSTRUCTIONS}\n\n{JSON_MODE_HINT}"
+    output_schema = schema_fallback = None
+    if schema is not None:
+        schema_instructions = (
+            f"{instructions or DEFAULT_INSTRUCTIONS}\n\n"
+            + SCHEMA_HINT.format(schema=json.dumps(schema, ensure_ascii=False))
+        )
+        if strict and _schema_key(schema) not in _REJECTED_SCHEMAS:
+            # Codex always sends output schemas in OpenAI's strict mode.
+            output_schema, schema_fallback = schema, schema_instructions
+        else:
+            # Non-strict (OpenAI's default) is best effort: describe the schema instead.
+            instructions = schema_instructions
     job = _Job(
         instructions=instructions,
         text=text,
         model=model,
         effort=requested_effort or suffix_effort,
         output_schema=output_schema,
+        schema_fallback=schema_fallback,
     )
     try:
         for url in image_urls:
@@ -155,39 +192,65 @@ async def _build_job(
     logger.info(
         "[%s] request model=%s effort=%s format=%s images=%d",
         job.request_id, model or "default", job.effort or "default",
-        "json_schema" if output_schema else ("json_object" if json_mode else "text"), len(job.images),
+        ("json_schema (strict)" if output_schema else "json_schema (instructions)") if schema is not None
+        else ("json_object" if json_mode else "text"),
+        len(job.images),
     )
     return job
 
 
-def _parse_response_format(response_format: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], bool]:
-    """Return (output JSON schema, json_object mode) for an OpenAI response_format."""
+def _schema_key(schema: Any) -> str:
+    return hashlib.sha256(json.dumps(schema, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _parse_response_format(
+    response_format: Optional[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], bool, bool]:
+    """Return (JSON schema, strict, json_object mode) for an OpenAI response_format."""
 
     if not response_format:
-        return None, False
+        return None, False, False
     kind = response_format.get("type")
     if kind in (None, "text"):
-        return None, False
+        return None, False, False
     if kind == "json_object":
-        return None, True
+        return None, False, True
     if kind == "json_schema":
-        schema = (response_format.get("json_schema") or {}).get("schema")
+        spec = response_format.get("json_schema") or {}
+        schema = spec.get("schema")
         if not isinstance(schema, dict):
             raise HTTPException(status_code=400, detail="response_format.json_schema.schema must be an object")
-        return schema, False
+        return schema, spec.get("strict") is True, False
     raise HTTPException(status_code=400, detail=f"Unsupported response_format type '{kind}'")
 
 
-def _http_error(e: CodexError) -> HTTPException:
-    return HTTPException(
-        status_code=e.status_code,
-        detail={"message": str(e), "type": "server_error" if e.status_code >= 500 else "upstream_error", "code": None},
+def _log_schema_fallback(job: _Job, error: CodexError) -> None:
+    logger.warning(
+        "[%s] strict output schema rejected (%s); retrying with the schema in the instructions, "
+        "so the answer is not enforced. Fix the schema to get strict JSON.",
+        job.request_id,
+        error,
     )
+
+
+def _http_error(e: CodexError) -> HTTPException:
+    if e.status_code == 400:
+        error_type = "invalid_request_error"
+    else:
+        error_type = "server_error" if e.status_code >= 500 else "upstream_error"
+    return HTTPException(status_code=e.status_code, detail={"message": str(e), "type": error_type, "code": e.code})
 
 
 async def _complete(job: _Job, result: TurnResult) -> str:
     try:
-        parts = [delta async for delta in job.stream(result)]
+        try:
+            parts = [delta async for delta in job.stream(result)]
+        except CodexError as e:
+            if not job.can_fall_back(e):
+                raise
+            _log_schema_fallback(job, e)
+            job = job.without_schema()
+            parts = [delta async for delta in job.stream(result)]
     except CodexError as e:
         raise _http_error(e)
     finally:
@@ -198,17 +261,25 @@ async def _complete(job: _Job, result: TurnResult) -> str:
 async def _open_stream(job: _Job, result: TurnResult) -> Tuple[AsyncIterator[str], Optional[str]]:
     """Start a stream and wait for its first delta, so startup errors become HTTP errors."""
 
-    stream = job.stream(result)
     try:
-        return stream, await stream.__anext__()
-    except StopAsyncIteration:
-        return stream, None
+        for attempt in (1, 2):
+            stream = job.stream(result)
+            try:
+                return stream, await stream.__anext__()
+            except StopAsyncIteration:
+                return stream, None
+            except CodexError as e:
+                if attempt == 2 or not job.can_fall_back(e):
+                    raise
+                _log_schema_fallback(job, e)
+                job = job.without_schema()
     except CodexError as e:
         job.cleanup()
         raise _http_error(e)
     except BaseException:
         job.cleanup()
         raise
+    raise AssertionError("unreachable")
 
 
 def _sse(payload: Dict[str, Any], event: Optional[str] = None) -> bytes:
