@@ -1,62 +1,25 @@
-# Environment Configuration (.env and OS env)
+# Environment configuration
 
-This project loads configuration via environment variables. It supports a `.env` file (using `pydantic-settings`) and OS‑level environment variables. This document is the authoritative reference for how to configure the server. It is intentionally English‑only and should be linked from both English and Japanese READMEs.
+The server reads its settings from environment variables. A `.env` file in the repository root is loaded automatically (via `pydantic-settings`); real environment variables take precedence, and unknown keys (such as docker compose's `HOST_UID`) are ignored. To load a different file, set `CODEX_ENV_FILE` (for example `.env.local`) in the OS environment before starting the server.
 
-## Files and Precedence
+| Variable | Default | Meaning |
+|---|---|---|
+| `PROXY_API_KEY` | unset | If set, every request must send `Authorization: Bearer <PROXY_API_KEY>`. |
+| `RATE_LIMIT_PER_MINUTE` | `0` | Requests per minute per client IP; `0` disables the limit. |
+| `CODEX_PATH` | `codex` | Codex binary (absolute path, or a name looked up on `PATH`). |
+| `CODEX_WORKDIR` | see below | Working directory of Codex threads; also holds temporary image files. Created if missing. |
+| `CODEX_SANDBOX_MODE` | `read-only` | `read-only`, `workspace-write` or `danger-full-access`. With the lean profile the model has no tools, so this only matters when `CODEX_LEAN=false`. |
+| `CODEX_TIMEOUT` | `120` | Seconds before a request is aborted with HTTP 504. |
+| `CODEX_MAX_PARALLEL_REQUESTS` | `8` | Maximum concurrent Codex turns; further requests wait for a free slot. |
+| `CODEX_LEAN` | `true` | Start the app-server with plugins, apps, hooks, multi-agent, shell/browser/computer-use tools, image generation, skills, web search, the `notify` hook and every configured MCP server turned off, and without Codex's sandbox-permission and environment-context instructions. Set `false` to expose the full Codex agent. |
+| `CODEX_HOME` | `~/.codex` | Codex's own variable: where `auth.json`, `config.toml` and `AGENTS.md` live. The server passes it through to Codex. |
 
-- Default file: `.env` at the repository root.
-- Override file: set `CODEX_ENV_FILE` as an OS env var before starting the server to load a different file (e.g., `.env.local`). Do not set `CODEX_ENV_FILE` inside `.env`.
-- OS env variables take precedence over values from the loaded file.
+`CODEX_WORKDIR` defaults to `/workspace` on Linux/macOS (the Docker layout) and `%LOCALAPPDATA%\codex-wrapper\workspace` on Windows. On Windows use an absolute path with a drive letter, because `/workspace` resolves to the root of the current drive.
 
-## Critical Variables
+## Codex credentials
 
-- `PROXY_API_KEY`: Bearer token required by this proxy (optional if you run without auth).
-- `RATE_LIMIT_PER_MINUTE`: Requests per minute allowed per client. `0` disables limiting.
-- `HOST_UID` / `HOST_GID`: UID/GID assigned to the `codex` user inside the Docker image (default `1000`). Set these to match the host user when bind-mounting `$HOME/.codex` so the container can reuse existing Codex credentials.
-- `CODEX_PATH`: Path to `codex` binary (default: `codex`).
-- `CODEX_WORKDIR`: Working directory for Codex runs (server enforces `cwd` to this path). Default: `/workspace` on Linux/macOS (Docker), `%LOCALAPPDATA%\codex-wrapper\workspace` on Windows. On Windows, always use an absolute path with a drive letter — `/workspace` resolves to the root of the current drive (e.g. `E:\workspace`) and the server logs a warning.
-  - Codex はこのディレクトリ階層で `AGENTS.md` を探索します。ラッパー API 特有の指示を適用したい場合は、ここ（または配下のサブディレクトリ）に `AGENTS.md` を配置してください。
-- `CODEX_CONFIG_DIR`: Optional directory to use as the Codex CLI home for this wrapper. When set, the server exports `CODEX_HOME` for subprocesses and guarantees the folder exists. Place your API-specific `config.toml` here.
-  - Leave this unset/empty when running in Docker so the container reuses the bind-mounted `${HOME}/.codex` directory.
-  - API 専用の `config.toml` や MCP 設定を分離したい場合に利用します（CLI を直接使う環境と分けられます）。
-- `CODEX_WRAPPER_PROFILE_DIR`: Optional path containing `codex_agents.md` / `codex_config.toml` overrides. Defaults to `workspace/codex_profile/` inside the repository. When these files are present the server copies them into the Codex home before startup (legacy filenames `agent.md` / `config.toml` are still accepted with a warning to aid migration).
-  - `codex_agents.sample.md` / `codex_config.sample.toml` をコピーして `codex_agents.md` / `codex_config.toml` を用意すると、サーバー起動時に Codex 側のファイルが上書きされます。旧名称を使っている場合は警告を参考にリネームしてください。
-- `CODEX_SANDBOX_MODE`: `read-only` | `workspace-write` | `danger-full-access`.
-- `CODEX_REASONING_EFFORT`: `minimal` | `low` | `medium` | `high`.
-- `CODEX_HIDE_REASONING`: `0`/`1`. When `1`, the wrapper asks Codex CLI to suppress "thinking" output (`hide_agent_reasoning=true`). Default `0` keeps the CLI’s standard behaviour.
-- `CODEX_LOCAL_ONLY`: `0`/`1`. When `1`, the server rejects non‑local provider base URLs.
-- `CODEX_ALLOW_DANGER_FULL_ACCESS`: `0`/`1`. When `1`, the API may request `x_codex.sandbox=danger-full-access`.
-- `CODEX_TIMEOUT`: Server‑side timeout for Codex runs (seconds; default 120).
-- `CODEX_MAX_PARALLEL_REQUESTS`: Maximum number of Codex subprocesses that may run at once (default 2). Raise this to improve throughput or set `1` to keep the historical serial behaviour. Values `<1` are treated as `1`.
-- `CODEX_ENV_FILE`: Name of the env file to load (set as an OS env var).
+Codex handles authentication itself: run `codex login` (ChatGPT sign-in) or `codex login --api-key ...` as the user that runs the server, with the same `CODEX_HOME`.
 
-### Model Selection
+## `AGENTS.md` in the Codex home
 
-- The server now discovers available models by invoking the Codex CLI (`codex models list`) during startup.
-- Whatever names Codex reports are exposed through `GET /v1/models`, and clients must use those exact names in the `model` field when calling the API.
-- Append ` minimal` / ` low` / ` medium` / ` high` to a model name to override the reasoning effort without using `x_codex.reasoning_effort`.
-- The legacy `CODEX_MODEL` environment variable is ignored. If it is present the server logs a warning so you can remove it from your configuration.
-
-## Codex CLI Credentials and Providers
-
-- Codex auth is managed by the CLI itself with `codex login`.
-- Credentials are stored at `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`). To relocate, set the OS env var `CODEX_HOME`. Do not put `CODEX_HOME` inside `.env`.
-- For OpenAI API‑key mode, Codex CLI reads `OPENAI_API_KEY` (this is consumed by Codex, not this proxy). OAuth mode does not require it.
-
-## Local‑Only Enforcement
-
-When `CODEX_LOCAL_ONLY=1`:
-- The server inspects `$CODEX_HOME/config.toml` `model_providers` and the built‑in OpenAI provider `OPENAI_BASE_URL`.
-- Any provider with a non‑local `base_url` (not localhost/127.0.0.1/[::1]/unix) is rejected with HTTP 400.
-
-## Danger Mode
-
-To allow full file/network access:
-1. Set `CODEX_ALLOW_DANGER_FULL_ACCESS=1` before starting the server.
-2. Send `x_codex.sandbox: "danger-full-access"` in the API request.
-
-Both are required. If `CODEX_LOCAL_ONLY=1`, the provider `base_url` must also be local.
-
-## Example `.env.example`
-
-See the repository’s `.env.example` for a starter template. Copy it to `.env` and adjust as needed.
+Codex adds `$CODEX_HOME/AGENTS.md` (or `AGENTS.override.md`) to every request as user instructions, and has no setting to skip it. The server logs a warning at startup if either file is non-empty. Empty it if that Codex home only serves the wrapper, or give the wrapper a separate `CODEX_HOME`.

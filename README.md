@@ -1,270 +1,139 @@
 # Codex-Wrapper
 
-FastAPI server that wraps Codex CLI behind a minimal OpenAI‑compatible API. It exposes `/v1/chat/completions` and `/v1/models` and supports SSE streaming.
+A FastAPI server that puts an OpenAI-compatible API in front of the [Codex CLI](https://github.com/openai/codex), so any OpenAI client can use a ChatGPT/Codex sign-in (or a Codex API-key login) by changing `base_url`. It needs a Codex CLI recent enough to have `codex app-server` (tested with 0.163).
 
-For Japanese instructions, see [README.ja.md](./README.ja.md).
+- `GET /v1/models`
+- `POST /v1/chat/completions` (streaming and non-streaming, `response_format` JSON schemas, images, token usage)
+- `POST /v1/responses` (minimal subset)
 
-- Reference submodule: `submodules/codex` (https://github.com/openai/codex.git)
-- Implementation plan: `docs/IMPLEMENTATION_PLAN.ja.md` (Japanese)
-- Agent guide: `docs/AGENTS.md` (English)
-- Responses API plan/progress: `docs/RESPONSES_API_PLAN.ja.md` (Japanese)
-- Environment configuration: `docs/ENV.md` (English)
+## How requests are served
 
-> Documentation languages: English and Japanese. Exceptions: Implementation Plan and Responses API Plan are maintained in Japanese only. See `CONTRIBUTING.md` for the doc sync policy.
+The server keeps one `codex app-server` process running and gives every request its own short-lived (ephemeral) Codex thread on it. Requests run in parallel (up to `CODEX_MAX_PARALLEL_REQUESTS`, default 8) and their streams never mix.
 
-## Quick Start
+The app-server is started with a lean profile: plugins, MCP servers, hooks, shell/browser/computer-use tools, skills and the injected sandbox/environment instructions are turned off, and the client's `system` message replaces Codex's agent prompt. A tiny request costs about 2.3k input tokens instead of about 13k.
 
-1) Dependencies
+Measured on Windows with `gpt-5.6-luna` (ChatGPT sign-in), using `scripts/bench_latency.py`:
+
+| | `codex exec` per request (old) | `codex app-server` (now) |
+|---|---|---|
+| small prompt, total | 4.6–5.4 s | 2.0–2.7 s |
+| streamed, first token | 4.3–4.5 s | 1.8–2.4 s |
+| 8 concurrent requests, wall | 20–27 s | 2.4–3.3 s |
+| `response_format: json_schema` | ignored | enforced |
+| `usage` | zeros | real token counts |
+
+What is left is the model backend's own time to first token.
+
+## Quick start
+
+1. Install [uv](https://docs.astral.sh/uv/) and the Codex CLI (`npm i -g @openai/codex`, or the desktop app's bundled CLI).
+2. Sign in to Codex as the same OS user that runs this server:
+
+   ```bash
+   codex login                     # ChatGPT sign-in
+   codex login --api-key "sk-..."  # or an OpenAI API key
+   ```
+
+3. Install dependencies and run:
+
+   ```bash
+   uv sync
+   cp .env.example .env            # optional, see docs/ENV.md
+   uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+   ```
+
+4. Point a client at it:
+
+   ```python
+   from openai import OpenAI
+
+   client = OpenAI(base_url="http://localhost:8000/v1", api_key="PROXY_API_KEY or anything")
+   resp = client.chat.completions.create(
+       model="gpt-5.6-luna low",
+       messages=[{"role": "user", "content": "Say hi"}],
+   )
+   print(resp.choices[0].message.content, resp.usage)
+   ```
+
+## API
+
+### Models
+
+`GET /v1/models` lists the models Codex reports for your account (`model/list`), each followed by one alias per reasoning effort the model supports, for example `gpt-5.6-luna low`. Omitting `model` in a request uses the model set in Codex's `config.toml`.
+
+### Chat completions
+
+Accepted request fields:
+
+- `model`, `messages` (`system`/`developer`/`user`/`assistant`/`tool`; text and image parts)
+- `stream`, `stream_options.include_usage`
+- `reasoning_effort` (`none`/`minimal` map to the lowest effort the model supports)
+- `response_format`: `{"type": "json_schema", "json_schema": {"name", "schema", "strict"}}` constrains the answer to the schema; `{"type": "json_object"}` asks for a JSON object
+- `temperature`, `max_tokens`: accepted and ignored
+
+Responses carry a unique `id` (`chatcmpl-...`), `created`, `model` and, when the backend reports it, `usage` with `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`. If usage is unavailable the field is omitted rather than zero-filled. Streams follow the OpenAI chunk format (role chunk, content deltas, a final `finish_reason: "stop"` chunk, an optional usage chunk, then `data: [DONE]`).
+
+How messages map to Codex: `system`/`developer` messages become the thread's base instructions. A single user message is sent as is. A longer conversation is sent as a `User:` / `Assistant:` transcript.
+
+Errors use FastAPI's format, `{"detail": {"message", "type", "code"}}`, with 401/429/504 passed through from Codex where they apply. Errors that happen before the first token of a stream are returned as HTTP errors too.
+
+### Responses API
+
+`POST /v1/responses` accepts `model`, `input` (string, content parts, or role/content messages), `instructions`, `reasoning.effort` and `stream`. Streaming emits `response.created`, `response.output_text.delta`, `response.output_text.done` and `response.completed` events.
+
+## Configuration
+
+All settings are environment variables (a `.env` file is loaded automatically). The full reference is [docs/ENV.md](docs/ENV.md). The most relevant ones:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CODEX_LEAN` | `true` | Disable plugins, MCP servers, hooks, tools and injected instructions in the app-server |
+| `CODEX_MAX_PARALLEL_REQUESTS` | `8` | Concurrent Codex turns |
+| `CODEX_TIMEOUT` | `120` | Seconds per request |
+| `PROXY_API_KEY` | unset | Require `Authorization: Bearer <key>` |
+| `RATE_LIMIT_PER_MINUTE` | `0` (off) | Requests per minute per client IP |
+| `CODEX_SANDBOX_MODE` | `read-only` | Sandbox for anything Codex executes |
+| `CODEX_HOME` | `~/.codex` | Codex home (read by Codex itself) |
+
+### The Codex home and `AGENTS.md`
+
+The wrapper uses your Codex home (`$CODEX_HOME`, default `~/.codex`) for auth and `config.toml`. Codex adds `$CODEX_HOME/AGENTS.md` to every request as user instructions, and there is no setting to skip it. The server logs a warning at startup if that file is not empty. Either empty it, or give the wrapper its own home: set `CODEX_HOME=<dir>` for the server and run `CODEX_HOME=<dir> codex login` once.
+
+## Logs and benchmark
+
+Each request logs its phases, for example:
+
+```
+[8e1d3705] app-server model=gpt-5.6-luna effort=low slot=0ms thread=173ms turn=188ms first_token=2359ms total=2470ms in=2341 cached=2176 out=8
+```
+
+`scripts/bench_latency.py` measures time to first token and total time for streamed and non-streamed calls, a ~3k-token prompt, strict JSON schemas, `GET /models` and a burst of concurrent requests:
 
 ```bash
-pip install -r requirements.txt
+uv run python scripts/bench_latency.py --base http://127.0.0.1:8000/v1 --runs 3
 ```
-
-2) Install Codex CLI (pick one)
-
-```bash
-npm i -g @openai/codex
-# or
-brew install codex
-```
-
-3) Sign in to Codex (OAuth or API key)
-
-Authentication happens in the Codex CLI, not in this API wrapper.
-
-Pattern A: OAuth (ChatGPT sign‑in)
-
-```bash
-# Run as the same OS user that runs this API server
-codex login
-```
-
-- After browser sign‑in, credentials are saved to `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`).
-- Headless/remote notes:
-  - SSH port‑forward: `ssh -L 1455:localhost:1455 <user>@<host>` → run `codex login` on the remote → open the printed URL in your local browser.
-  - Or log in locally and copy `auth.json` to the server: `scp ~/.codex/auth.json user@host:~/.codex/auth.json`.
-
-Pattern B: API key (metered, alternative)
-
-```bash
-codex login --api-key "<YOUR_OPENAI_API_KEY>"
-```
-
-- Use an OpenAI API key that has access to the Responses API.
-- If the server runs with `CODEX_LOCAL_ONLY=1`, the built‑in OpenAI provider’s remote `base_url` will be rejected (400). For API‑key usage, keep `CODEX_LOCAL_ONLY=0` in most cases.
-
-Common notes
-- You can relocate `auth.json` by setting the OS environment variable `CODEX_HOME` (for example: `/opt/codex`). Configure this as an OS env var, not inside `.env`.
-- If you switch auth modes, consider recreating `~/.codex/auth.json` by running `codex login` again.
-
-4) Configure Codex (example using OpenAI gpt‑5)
-
-```bash
-mkdir -p ~/.codex
-cp docs/examples/codex-config.example.toml ~/.codex/config.toml
-```
-
-To use OpenAI’s gpt‑5 model (when using API‑key mode), configure the Codex CLI with the appropriate provider credentials. This wrapper now queries the CLI for available models at startup, so call `GET /v1/models` to discover the names you can use. For OAuth, `OPENAI_API_KEY` is not required.
-
-4b) Optional: Repository guidance for Codex
-
-```bash
-# Copy the AGENTS template for repository-wide instructions
-cp docs/examples/AGENTS.example.md AGENTS.md
-
-# Or set wrapper-specific guidance inside the Codex workdir
-cp docs/examples/AGENTS.example.md $CODEX_WORKDIR/AGENTS.md
-```
-
-With `CODEX_WORKDIR` set (default `/workspace` on Linux/macOS, `%LOCALAPPDATA%\codex-wrapper\workspace` on Windows), Codex merges any `AGENTS.md` files under that directory hierarchy when the wrapper executes requests.
-
-4c) Optional: Wrapper bootstrap profile overrides
-
-The repository ships sample overrides in `workspace/codex_profile/`:
-
-- `codex_agents.sample.md` → rename/copy to `codex_agents.md`
-- `codex_config.sample.toml` → rename/copy to `codex_config.toml`
-
-When these files exist, the server copies them into the Codex home (`AGENTS.md` / `config.toml`) at startup. Legacy filenames (`agent.md` / `config.toml`) are still honoured for backwards compatibility, but the wrapper logs a warning so you can migrate safely. The real override files stay ignored by git (see `.gitignore`) to keep local, project-specific instructions out of version control.
-
-5) Environment Variables (.env supported)
-
-This server automatically loads `.env` using `pydantic-settings`. See `docs/ENV.md` for complete details.
-
-```bash
-cp .env.example .env
-# Edit .env with your favorite editor
-```
-
-If you want to override values ad‑hoc in the shell, you can still use `export`.
-
-Advanced: if you prefer a file other than `.env`, set `CODEX_ENV_FILE` as an OS environment variable before starting the server (set it in the shell, not inside `.env`).
-
-```bash
-export CODEX_ENV_FILE=.env.local
-```
-
-6) Run the server
-
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-7) Connect from an SDK
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="YOUR_PROXY_API_KEY")
-```
-
-See `docs/IMPLEMENTATION_PLAN.ja.md` (Japanese) and `docs/AGENTS.md` for details.
-
-> Streaming responses now forward Codex CLI output verbatim. Adjust your Codex profile/config if you want to suppress banners or warnings.
-> Requests are executed concurrently up to the configured `CODEX_MAX_PARALLEL_REQUESTS` limit (default 2).
 
 ## Docker
 
-The repository ships a Dockerfile that bundles this FastAPI wrapper together with the Codex CLI.
-
-### Build the image
-
 ```bash
-docker build -t codex-wrapper .
-```
-
-### Run with Docker Compose (recommended for local development)
-
-```bash
-# Build the image declared in docker-compose.yml
 docker compose build
-
-# Run Codex authentication once (OAuth or API key) inside the container
-docker compose run --rm codex-wrapper codex login
-
-# Start the API server (binds to localhost:8000 by default)
+docker compose run --rm codex-wrapper codex login   # once, stores auth in the mounted ~/.codex
 docker compose up
 ```
 
-Notes
-- The compose file bind-mounts `${HOME}/.codex` into the container so it reuses the same Codex credentials you already configured in WSL. Make sure the directory exists (`mkdir -p ~/.codex`) before running `docker compose`.
-- `.env` is loaded via `env_file` to keep configuration in sync with non-container runs.
-- The container exposes the same `/v1/models` discovery as the bare-metal setup because the server still shells out to the bundled Codex CLI (`codex models list`).
-- You can launch ad-hoc Codex commands inside the container, for example `docker compose run --rm codex-wrapper codex models list`, to troubleshoot authentication before starting the API.
+The compose file publishes the API on `localhost:8020` and mounts `${HOME}/.codex` into the container.
 
-### Models exposed by `/v1/models`
+## Security notes
 
-Sample response on 2025-09-18 (call the endpoint in your environment to confirm):
+- Codex threads always run with `approvalPolicy=never` and the configured sandbox (`read-only` by default). In the lean profile the model has no shell or tools at all.
+- Image inputs must be `data:` URIs (written to a temporary file in the work directory, deleted after the request) or http(s) URLs (fetched by Codex). `file://` URLs and paths are rejected, so clients cannot make the server read local files.
+- `PROXY_API_KEY` protects this API; it is unrelated to Codex's own login.
 
-- `gpt-5`
-- `gpt-5-codex`
-
-You can append ` minimal` / ` low` / ` medium` / ` high` to any of the above IDs to override reasoning effort inline (for example: `gpt-5-codex high`).
-
-Minimal Responses API compatibility (non‑stream/stream) is implemented; see `docs/RESPONSES_API_PLAN.ja.md` (Japanese) for details and future work.
-Structured output features such as `response_format`/JSON Schema are not supported because the Codex CLI only returns plain text and this wrapper normalizes those results into strings.
-
-## Environment Variables (Authoritative)
-
-This server reads `.env` and uses the following variables. Example values and constraints follow the current Codex submodule docs (`submodules/codex`).
-
-- PROXY_API_KEY: API token for this wrapper. If unset, the server can run without auth.
-- RATE_LIMIT_PER_MINUTE: Allowed requests per minute. 0 disables limiting.
-- CODEX_PATH: Path to the `codex` binary. Default `codex`.
-- CODEX_WORKDIR: Working directory for Codex executions (`cwd`). Default `/workspace` on Linux/macOS (Docker) and `%LOCALAPPDATA%\codex-wrapper\workspace` on Windows.
-  - On Windows, use an absolute path with a drive letter; `/workspace` resolves to the root of the current drive (e.g. `E:\workspace`).
-  - Ensure this directory is writable by the server user; otherwise Codex fails with `Failed to create CODEX_WORKDIR ... Read-only file system`.
-  - Codex merges any `AGENTS.md` files under this directory tree when the wrapper runs requests; copy `docs/examples/AGENTS.example.md` here (or deeper) to provide project instructions.
-- CODEX_CONFIG_DIR: Optional directory treated as `CODEX_HOME` for this wrapper. When set, the server creates it if missing and runs Codex CLI with that directory as its config root; place wrapper-specific `config.toml`, `auth.json`, or MCP settings here.
-- CODEX_WRAPPER_PROFILE_DIR: Optional directory containing `codex_agents.md` / `codex_config.toml` that the wrapper copies into the Codex home before startup. Defaults to `workspace/codex_profile/`; the repository only ships samples (`codex_agents.sample.md`, `codex_config.sample.toml`). Legacy filenames (`agent.md`, `config.toml`) remain supported with a startup warning to ease migration.
-- CODEX_MODEL: **Deprecated.** Model selection is automatic; setting this variable has no effect (a warning is logged if present).
-  - Note: The string is free‑form, but it must be a model name supported by the selected `model_provider` (OpenAI by default).
-- CODEX_SANDBOX_MODE: Sandbox mode. One of: `read-only` | `workspace-write` | `danger-full-access`.
-  - For `workspace-write`, the wrapper adds `--config sandbox_workspace_write='{ network_access = <true|false> }'` when the API request specifies `x_codex.network_access`.
-- CODEX_REASONING_EFFORT: Reasoning effort. One of: `minimal` | `low` | `medium` | `high` (default `medium`).
-- CODEX_HIDE_REASONING: `true`/`false`. Default `false`. Set to `true` to tell the Codex CLI to enable `hide_agent_reasoning` and suppress “thinking” blocks at the source.
-- CODEX_LOCAL_ONLY: `0`/`1`. Default `0` (recommended).
-  - If `1`, any non‑local model provider `base_url` (not localhost/127.0.0.1/[::1]/unix) is rejected with 400.
-  - The server checks `$CODEX_HOME/config.toml` `model_providers` and the built‑in `openai` provider’s `OPENAI_BASE_URL`. Unknown/missing settings are rejected conservatively.
-- CODEX_ALLOW_DANGER_FULL_ACCESS: `0`/`1` (default `0`). When `1`, the API may request `x_codex.sandbox: "danger-full-access"`.
-  - Safety note: Only set `1` inside isolated containers/VMs.
-- CODEX_TIMEOUT: Server‑side timeout (seconds) for Codex runs (default 120).
-- CODEX_MAX_PARALLEL_REQUESTS: Maximum Codex subprocesses allowed at once (default 2). Increase the value to serve more concurrent API calls or set to `1` to restore the previous serial behaviour.
-- CODEX_ENV_FILE: Path to the `.env` file to load. Must be set as an OS env var before the server starts (do not place this inside `.env`). Defaults to `.env`.
-
-Auth notes
-- Both OAuth (ChatGPT) and API‑key modes are handled by Codex CLI. Run `codex login` as the same OS user as the server process.
-- `auth.json` location is `$CODEX_HOME` (default `~/.codex`). If you move it, set `CODEX_HOME` as an OS env var (not in `.env`).
-- `PROXY_API_KEY` controls access to this wrapper; it is unrelated to Codex OAuth.
-- ChatGPT login does not require `OPENAI_API_KEY`; API‑key usage does.
-- With `CODEX_LOCAL_ONLY=1`, remote `base_url`s (like OpenAI) are rejected; be mindful when using API‑key mode.
-
-Codex highlights
-- model: The Codex CLI currently surfaces `gpt-5` and `gpt-5-codex` for this account (verified 2025-09-17 via `GET /v1/models`). Append ` minimal` / ` low` / ` medium` / ` high` to request a specific reasoning effort (e.g. `gpt-5-codex high`).
-- sandbox_mode: Supports `read-only` (default) / `workspace-write` / `danger-full-access`. For `workspace-write`, `sandbox_workspace_write.network_access` (default false) can be tuned.
-- model_reasoning_effort: `minimal`/`low`/`medium`/`high`.
-
-Provider‑specific env vars
-- With the OpenAI provider in API‑key mode, Codex CLI reads `OPENAI_API_KEY`. This belongs to Codex, not this wrapper (OAuth mode does not require it).
-- For custom providers or local inference (e.g., `ollama`), edit `~/.codex/config.toml` `model_providers` to set `base_url`, etc.
-
-See `.env.example` for a template.
-
-### Danger Mode and Local‑Only
-
-1) Set `CODEX_ALLOW_DANGER_FULL_ACCESS=1` and start the server.
-2) In a request, set `x_codex.sandbox: "danger-full-access"`.
-
-Both must hold to allow danger mode:
-- Server has `CODEX_ALLOW_DANGER_FULL_ACCESS=1`.
-- Additionally, if `CODEX_LOCAL_ONLY=1` then provider `base_url` must be local.
-
-If either condition fails, the server responds 400.
-
-## Codex TOML Config (`config.toml`)
-
-- Location: `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`).
-- Example file: `docs/examples/codex-config.example.toml`.
+## Development
 
 ```bash
-mkdir -p ~/.codex
-cp docs/examples/codex-config.example.toml ~/.codex/config.toml
+uv sync
+uv run pytest
 ```
 
-- For OpenAI default provider with API‑key mode, set `OPENAI_API_KEY` (read by Codex CLI, not this wrapper).
-- To enable web search, set `tools.web_search = true` in `config.toml` (disabled by default).
-- Configure MCP servers under `mcp_servers` (stdio transport). See the example file.
-
-### Multiple Codex Configs
-
-You can run several wrapper instances, each backed by a different Codex configuration. Launch one process per backend, set a unique `CODEX_HOME` (this must be an OS env var, not inside `.env`), and keep ports/env files separate with `CODEX_ENV_FILE` when you need different `.env` content.
-
-```bash
-# Instance A (production)
-CODEX_HOME=/opt/codex-prod CODEX_ENV_FILE=.env.prod uvicorn app.main:app --port 8000
-
-# Instance B (staging)
-CODEX_HOME=/opt/codex-stage CODEX_ENV_FILE=.env.stage uvicorn app.main:app --port 8001
-```
-
-Each directory specified by `CODEX_HOME` (e.g., `/opt/codex-prod`) should contain its own `config.toml` and optional `auth.json`, letting you serve multiple Codex backends side by side.
-
-## Notes and Policy
-
-- Do not share your personal ChatGPT/Codex account or resell access. This may violate OpenAI’s terms.
-- To use safely:
-  - Keep the server private for your own use.
-  - For team usage, switch to a proper API setup and give each user their own key.
-  - Use rate limiting, avoid key sharing, and manage logs responsibly.
-
-## Caution
-
-- This repository is an experimental project that was created quickly via “vibe coding.”
-- Beyond the rough architecture, the author may not have full awareness of all implementation details.
-- Before any production use or third‑party access, independently review the code, configuration, dependencies, and security posture.
-
-## Language and Sync Policy
-
-- All user‑facing docs are maintained in English and Japanese with equivalent content.
-- AGENT documentation is English‑only by design (`docs/AGENTS.md`).
-- The Environment Variables section is provided in English in both READMEs by policy.
-- See `CONTRIBUTING.md` for required steps to keep both languages in sync.
+Tests use `tests/fake_app_server.py`, a stand-in for `codex app-server` that speaks the same JSON-RPC protocol, so they never call a real model.
