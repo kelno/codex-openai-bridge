@@ -21,48 +21,28 @@ def _default_codex_workdir() -> str:
 
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
+    """Application settings loaded from environment variables and `.env`."""
 
     proxy_api_key: Optional[str] = Field(default=None, alias="PROXY_API_KEY")
-    # Docker ビルドで使用するホスト UID/GID。アプリ本体では未使用だが、.env の互換性維持のため受理する。
-    host_uid: Optional[int] = Field(default=None, alias="HOST_UID")
-    host_gid: Optional[int] = Field(default=None, alias="HOST_GID")
-    codex_workdir: str = Field(
-        default_factory=_default_codex_workdir, alias="CODEX_WORKDIR"
-    )
-    codex_config_dir: Optional[str] = Field(default=None, alias="CODEX_CONFIG_DIR")
-    codex_profile_dir: Optional[str] = Field(
-        default=None, alias="CODEX_WRAPPER_PROFILE_DIR"
-    )
+    rate_limit_per_minute: int = Field(default=0, alias="RATE_LIMIT_PER_MINUTE")
     codex_path: str = Field(default="codex", alias="CODEX_PATH")
-    codex_node_path: Optional[str] = Field(default=None, alias="CODEX_NODE_PATH")
+    codex_workdir: str = Field(default_factory=_default_codex_workdir, alias="CODEX_WORKDIR")
     sandbox_mode: str = Field(default="read-only", alias="CODEX_SANDBOX_MODE")
-    workspace_network_access: bool = Field(
-        default=False, alias="CODEX_WORKSPACE_NETWORK_ACCESS"
-    )
-    reasoning_effort: str = Field(default="medium", alias="CODEX_REASONING_EFFORT")
-    local_only: bool = Field(default=False, alias="CODEX_LOCAL_ONLY")
     timeout_seconds: int = Field(default=120, alias="CODEX_TIMEOUT")
-    max_parallel_requests: int = Field(
-        default=2, alias="CODEX_MAX_PARALLEL_REQUESTS"
-    )
-    rate_limit_per_minute: int = Field(default=60, alias="RATE_LIMIT_PER_MINUTE")
-    hide_reasoning: bool = Field(default=False, alias="CODEX_HIDE_REASONING")
-    # Allow server to honor x_codex.sandbox == "danger-full-access" requests.
-    # When false, such requests are blocked if received (unless CODEX_LOCAL_ONLY is also false
-    # in older behavior). Prefer enabling this explicitly for safety.
-    allow_danger_full_access: bool = Field(default=False, alias="CODEX_ALLOW_DANGER_FULL_ACCESS")
-    # Deprecated: ignored, but kept to avoid startup failures when legacy env remains.
-    codex_model: Optional[str] = Field(default=None, alias="CODEX_MODEL")
+    max_parallel_requests: int = Field(default=8, alias="CODEX_MAX_PARALLEL_REQUESTS")
+    # Start the app-server with plugins, MCP servers, hooks, tools and injected
+    # agent instructions turned off.
+    lean: bool = Field(default=True, alias="CODEX_LEAN")
 
-    # Default to loading from ".env". You can override the path by
-    # passing `_env_file` when instantiating `Settings` (see bottom).
-    model_config = SettingsConfigDict(case_sensitive=False, env_file=".env")
+    # `.env` may also hold variables for docker compose (HOST_UID, ...); ignore them.
+    model_config = SettingsConfigDict(case_sensitive=False, env_file=".env", extra="ignore")
 
-# Allow overriding env file path via process env `CODEX_ENV_FILE`.
-# Note: this variable must be set in the OS/process environment (not inside .env),
-# because it controls which .env file to read.
-_ENV_FILE = os.getenv("CODEX_ENV_FILE") or ".env"
 
-# Instantiate settings, optionally pointing to a custom env file.
-settings = Settings(_env_file=_ENV_FILE)
+def codex_home() -> Path:
+    """The Codex home directory (where auth.json, config.toml and AGENTS.md live)."""
+
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+
+
+# Allow overriding the env file path via the process env `CODEX_ENV_FILE`.
+settings = Settings(_env_file=os.getenv("CODEX_ENV_FILE") or ".env")

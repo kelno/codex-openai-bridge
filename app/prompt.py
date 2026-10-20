@@ -1,113 +1,86 @@
-from typing import List, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+_ROLE_LABELS = {"user": "User", "assistant": "Assistant", "tool": "Tool", "function": "Tool"}
 
 
 def _content_to_text(content: Any) -> str:
     """Best-effort conversion of message `content` into plain text.
 
-    Supported variants:
-    - str → as-is
-    - list of {type:"text"|"input_text", text} → join text fields
-    - list of str → join
-    - any other → stringified
+    Accepts a string, a list of OpenAI content parts (`text`/`input_text`), or a
+    list of strings. Non-text parts (images, ...) are skipped.
     """
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        # Typed parts (OpenAI-style content parts)
         parts: List[str] = []
         for p in content:
             if isinstance(p, dict):
-                t = p.get("type")
-                if t in ("text", "input_text") and isinstance(p.get("text"), str):
+                if p.get("type") in ("text", "input_text") and isinstance(p.get("text"), str):
                     parts.append(p["text"])
-                # Ignore non-text parts (images, tool calls, etc.)
             elif isinstance(p, str):
                 parts.append(p)
-        if parts:
-            return "".join(parts)
-    # Fallback: stringify
-    try:
-        return str(content)
-    except Exception:
-        return ""
+        return "".join(parts)
+    return str(content)
 
 
 def _extract_images(content: Any) -> List[str]:
-    """Extract image URLs from a message `content` structure."""
+    """Collect image URLs from OpenAI content parts."""
     images: List[str] = []
     if isinstance(content, list):
         for p in content:
-            if isinstance(p, dict):
-                t = p.get("type")
-                if t in ("image_url", "input_image", "image"):
-                    url_obj = p.get("image_url") or p.get("url")
-                    if isinstance(url_obj, dict):
-                        url = url_obj.get("url")
-                    else:
-                        url = url_obj
-                    if isinstance(url, str):
-                        images.append(url)
+            if isinstance(p, dict) and p.get("type") in ("image_url", "input_image", "image"):
+                url_obj = p.get("image_url") or p.get("url")
+                url = url_obj.get("url") if isinstance(url_obj, dict) else url_obj
+                if isinstance(url, str):
+                    images.append(url)
     return images
 
 
-def build_prompt_and_images(messages: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
-    """Convert chat messages into a prompt string and collect image URLs."""
+def split_messages(messages: List[Dict[str, Any]]) -> Tuple[Optional[str], str, List[str]]:
+    """Split chat messages into (instructions, turn input text, image URLs).
+
+    System and developer messages become the thread's base instructions. A
+    single user message is passed through verbatim; a longer conversation is
+    rendered as a role-labelled transcript ending with the latest message.
+    """
     system_parts: List[str] = []
-    convo: List[Dict[str, Any]] = []
+    convo: List[Tuple[str, str]] = []
     images: List[str] = []
 
     for m in messages:
-        role = (m.get("role") or "").strip().lower()
-        # Treat 'developer' as 'system' for compatibility
-        normalized_role = "system" if role == "developer" else role
+        role = (m.get("role") or "").strip().lower() or "user"
         content = m.get("content")
         images.extend(_extract_images(content))
         text = _content_to_text(content)
-        if normalized_role == "system":
-            if text:
+        if role in ("system", "developer"):
+            if text.strip():
                 system_parts.append(text.strip())
         else:
-            convo.append({"role": normalized_role or "user", "content": text})
+            convo.append((role, text))
 
-    lines: List[str] = []
-    if system_parts:
-        lines.append("\n".join(system_parts))
-        lines.append("")
+    instructions = "\n\n".join(system_parts) or None
+    if len(convo) == 1 and convo[0][0] == "user":
+        return instructions, convo[0][1], images
 
-    for msg in convo:
-        role = "User" if msg["role"] == "user" else "Assistant"
-        lines.append(f"{role}: {msg['content'].strip()}")
-
-    lines.append("Assistant:")
-    return "\n".join(lines), images
+    lines = [f"{_ROLE_LABELS.get(role, role.capitalize())}: {text.strip()}" for role, text in convo]
+    return instructions, "\n\n".join(lines), images
 
 
-def normalize_responses_input(inp: Any) -> List[Dict[str, Any]]:
-    """Normalize Responses API `input` into OpenAI chat `messages`.
+def normalize_responses_input(inp: Any, instructions: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Normalize a Responses API `input` (plus optional `instructions`) into chat messages."""
 
-    Supported variants (minimal):
-    - str → single user message
-    - list of content parts (`input_text`/`input_image`/...) → single user message
-    - list of {role, content} (chat-like) → pass through
-    - list of str → concatenate
-    """
+    messages: List[Dict[str, Any]] = []
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
     if isinstance(inp, str):
-        return [{"role": "user", "content": inp}]
-
+        return messages + [{"role": "user", "content": inp}]
     if isinstance(inp, list):
-        # list of dict with type field (content parts)
         if inp and isinstance(inp[0], dict) and "type" in inp[0] and "role" not in inp[0]:
-            return [{"role": "user", "content": inp}]
-
-        # list of dict with role/content (chat-like)
+            return messages + [{"role": "user", "content": inp}]
         if all(isinstance(x, dict) and "role" in x and "content" in x for x in inp):
-            msgs: List[Dict[str, Any]] = []
-            for x in inp:
-                msgs.append({"role": str(x.get("role")), "content": x.get("content")})
-            return msgs
-
-        # list of str → concatenate
+            return messages + [{"role": str(x["role"]), "content": x["content"]} for x in inp]
         if all(isinstance(x, str) for x in inp):
-            return [{"role": "user", "content": "".join(inp)}]
-
+            return messages + [{"role": "user", "content": "".join(inp)}]
     raise ValueError("Unsupported input format for Responses API")
