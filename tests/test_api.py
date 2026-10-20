@@ -92,7 +92,8 @@ def test_non_stream_returns_unique_ids_and_real_usage(client, backend_log):
     assert thread["ephemeral"] is True
     assert thread["approvalPolicy"] == "never"
     assert thread["sandbox"] == "read-only"
-    assert thread["model"] == "gpt-5"
+    assert "model" not in thread  # chosen per turn, so spare threads work for any model
+    assert backend_log("turn/start")[0]["model"] == "gpt-5"
 
 
 def test_usage_is_omitted_when_not_reported(client):
@@ -145,7 +146,7 @@ def test_omitted_model_uses_codex_default(client, backend_log):
     resp = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "x"}]})
     assert resp.status_code == 200
     assert resp.json()["model"] == "gpt-5"  # reported by the app-server for the new thread
-    assert "model" not in backend_log("thread/start")[0]
+    assert "model" not in backend_log("turn/start")[0]
 
 
 def test_unknown_model_is_404(client):
@@ -275,3 +276,60 @@ def test_warns_when_global_agents_md_not_empty(caplog):
     with caplog.at_level("WARNING", logger="app.codex"):
         codex_module.warn_if_global_agents_md()
     assert any("AGENTS.md is not empty" in r.getMessage() for r in caplog.records)
+
+
+def _wait_for(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _npc(client, system, content="hi", **body):
+    payload = {"model": "gpt-5", "messages": [{"role": "system", "content": system},
+                                              {"role": "user", "content": content}], **body}
+    return client.post("/v1/chat/completions", json=payload)
+
+
+def test_spare_threads_are_used_for_the_same_system_prompt(client, backend_log):
+    assert _npc(client, "You are a baker.").status_code == 200
+    # The first request starts its own thread, then two spares are started in the background.
+    assert _wait_for(lambda: len(backend_log("thread/start")) == 3)
+    spare_ids = {t["_threadId"] for t in backend_log("thread/start")[1:]}
+
+    assert _npc(client, "You are a baker.", model="gpt-5 low").status_code == 200
+    turn = backend_log("turn/start")[1]
+    assert turn["threadId"] in spare_ids
+    assert turn["model"] == "gpt-5" and turn["effort"] == "low"
+    # The used spare is replaced; the pool stays at two.
+    assert _wait_for(lambda: len(backend_log("thread/start")) == 4)
+
+
+def test_spare_threads_are_not_shared_across_system_prompts(client, backend_log):
+    _npc(client, "You are a baker.")
+    assert _wait_for(lambda: len(backend_log("thread/start")) == 3)
+
+    _npc(client, "You are a guard.")
+    threads = {t["_threadId"]: t for t in backend_log("thread/start")}
+    turn = backend_log("turn/start")[1]
+    assert threads[turn["threadId"]]["baseInstructions"] == "You are a guard."
+
+
+def test_idle_threads_zero_disables_the_pool(monkeypatch, client, backend_log):
+    monkeypatch.setattr(settings, "idle_threads", 0)
+    for _ in range(3):
+        _npc(client, "You are a baker.")
+    time.sleep(0.3)
+    assert len(backend_log("thread/start")) == 3
+
+
+def test_stale_spare_threads_are_discarded(monkeypatch, client, backend_log):
+    monkeypatch.setattr(codex_module, "_SPARE_MAX_AGE", 0.0)
+    _npc(client, "You are a baker.")
+    assert _wait_for(lambda: len(backend_log("thread/start")) == 3)
+    spare_ids = {t["_threadId"] for t in backend_log("thread/start")[1:]}
+
+    _npc(client, "You are a baker.")
+    assert backend_log("turn/start")[1]["threadId"] not in spare_ids

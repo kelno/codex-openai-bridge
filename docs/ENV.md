@@ -11,6 +11,7 @@ The server reads its settings from environment variables. A `.env` file in the r
 | `CODEX_SANDBOX_MODE` | `read-only` | `read-only`, `workspace-write` or `danger-full-access`. With the lean profile the model has no tools, so this only matters when `CODEX_LEAN=false`. |
 | `CODEX_TIMEOUT` | `120` | Seconds before a request is aborted with HTTP 504. |
 | `CODEX_MAX_PARALLEL_REQUESTS` | `8` | Maximum concurrent Codex turns; further requests wait for a free slot. |
+| `CODEX_IDLE_THREADS` | `2` | Pre-started spare threads kept per system prompt, so requests skip thread start and Codex's per-thread setup (saves ~0.6–1 s). Raise it to the size of your typical burst if clients send many concurrent requests with the same system prompt. Spares exist for at most 8 recently used system prompts and are discarded after 10 minutes unused. Each serves one request only. `0` disables the pool. |
 | `CODEX_LEAN` | `true` | Start the app-server with plugins, apps, hooks, multi-agent, shell/browser/computer-use tools, image generation, skills, web search, the `notify` hook and every configured MCP server turned off, and without Codex's sandbox-permission and environment-context instructions. Set `false` to expose the full Codex agent. |
 | `CODEX_HOME` | `~/.codex` | Codex's own variable: where `auth.json`, `config.toml` and `AGENTS.md` live. The server passes it through to Codex. |
 

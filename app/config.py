@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     sandbox_mode: str = Field(default="read-only", alias="CODEX_SANDBOX_MODE")
     timeout_seconds: int = Field(default=120, alias="CODEX_TIMEOUT")
     max_parallel_requests: int = Field(default=8, alias="CODEX_MAX_PARALLEL_REQUESTS")
+    # Pre-started threads kept per system prompt, so requests skip thread start and
+    # Codex's per-thread setup before the first turn (~0.6-1 s).
+    idle_threads: int = Field(default=2, alias="CODEX_IDLE_THREADS")
     # Start the app-server with plugins, MCP servers, hooks, tools and injected
     # agent instructions turned off.
     lean: bool = Field(default=True, alias="CODEX_LEAN")

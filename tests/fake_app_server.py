@@ -73,10 +73,15 @@ def main():
         method = msg.get("method")
         params = msg.get("params") or {}
         rid = msg.get("id")
-        if method:
-            log(method, params)
         if rid is None:
+            if method:
+                log(method, params)
             continue  # notification (e.g. "initialized")
+        if method == "thread/start":
+            thread_id = str(uuid.uuid4())
+            log(method, {**params, "_threadId": thread_id})
+        elif method:
+            log(method, params)
         if method == "initialize":
             send({"id": rid, "result": {"userAgent": "fake"}})
         elif method == "model/list":
@@ -86,7 +91,6 @@ def main():
                 {"id": "gpt-secret", "hidden": True, "supportedReasoningEfforts": []},
             ]}})
         elif method == "thread/start":
-            thread_id = str(uuid.uuid4())
             threads[thread_id] = params
             send({"id": rid, "result": {"thread": {"id": thread_id}, "model": params.get("model") or "gpt-5"}})
         elif method == "turn/start":

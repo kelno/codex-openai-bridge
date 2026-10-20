@@ -21,6 +21,7 @@ import re
 import shutil
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 _STREAM_LIMIT = 64 * 1024 * 1024  # turn/completed can carry the whole turn
 _REQUEST_TIMEOUT = 60.0
+# Spare-thread pool limits: distinct system prompts kept, and how long a spare may sit idle.
+_SPARE_MAX_PROMPTS = 8
+_SPARE_MAX_AGE = 600.0
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 DEFAULT_INSTRUCTIONS = "You are a helpful assistant."
@@ -225,6 +229,10 @@ class AppServerClient:
         self._threads: Dict[str, asyncio.Queue] = {}
         self._limiter = _Limiter()
         self.models: Dict[str, ModelInfo] = {}
+        # Pre-started, never-used threads keyed by base instructions:
+        # instructions -> [(thread id, thread's default model, monotonic start time)]
+        self._spares: "OrderedDict[str, List[Tuple[str, Optional[str], float]]]" = OrderedDict()
+        self._refills: Dict[str, asyncio.Task] = {}
 
     @property
     def running(self) -> bool:
@@ -304,6 +312,10 @@ class AppServerClient:
         proc, self._proc = self._proc, None
         self._start_lock = None  # bound to the current event loop
         self._limiter.reset()
+        refills, self._refills = list(self._refills.values()), {}
+        for task in refills:
+            task.cancel()
+        self._spares.clear()  # the threads live inside the process being stopped
         if proc is None:
             return
         if proc.returncode is None:
@@ -342,10 +354,10 @@ class AppServerClient:
                     continue
                 self._dispatch(msg)
         finally:
-            if self._proc is proc:
+            if self._proc is proc:  # unexpected exit (close() clears _proc first)
                 self._proc = None
-            logger.warning("codex app-server exited (code %s)", proc.returncode)
-            self._fail_all(f"codex app-server exited (code {proc.returncode})")
+                logger.warning("codex app-server exited (code %s)", proc.returncode)
+                self._fail_all(f"codex app-server exited (code {proc.returncode})")
 
     async def _read_stderr(self, proc: asyncio.subprocess.Process) -> None:
         while True:
@@ -414,6 +426,63 @@ class AppServerClient:
         with suppress(Exception):
             self._send({"id": f"{method}-{uuid.uuid4().hex[:8]}", "method": method, "params": params})
 
+    # --- threads -----------------------------------------------------------------
+
+    async def _start_thread(self, instructions: str) -> Tuple[str, Optional[str]]:
+        """Start an ephemeral thread; return (thread id, the thread's default model)."""
+
+        thread = await self._request(
+            "thread/start",
+            {
+                "cwd": str(Path(settings.codex_workdir).expanduser()),
+                "ephemeral": True,
+                "approvalPolicy": "never",
+                "sandbox": settings.sandbox_mode,
+                "baseInstructions": instructions,
+            },
+        )
+        return thread["thread"]["id"], thread.get("model")
+
+    def _take_spare(self, instructions: str) -> Optional[Tuple[str, Optional[str]]]:
+        spares = self._spares.get(instructions)
+        if spares is None:
+            return None
+        self._spares.move_to_end(instructions)
+        now = time.monotonic()
+        while spares:
+            thread_id, default_model, created = spares.pop(0)
+            if now - created < _SPARE_MAX_AGE:
+                return thread_id, default_model
+            self._forget("thread/unsubscribe", {"threadId": thread_id})
+        return None
+
+    def _refill_spares(self, instructions: str) -> None:
+        """Top up the spare threads for these instructions in the background."""
+
+        if settings.idle_threads <= 0 or not self.running or instructions in self._refills:
+            return
+        self._refills[instructions] = asyncio.create_task(self._refill(instructions))
+
+    async def _refill(self, instructions: str) -> None:
+        try:
+            spares = self._spares.setdefault(instructions, [])
+            self._spares.move_to_end(instructions)
+            while len(self._spares) > _SPARE_MAX_PROMPTS:
+                _, evicted = self._spares.popitem(last=False)
+                for thread_id, _, _ in evicted:
+                    self._forget("thread/unsubscribe", {"threadId": thread_id})
+            while self.running and len(spares) < settings.idle_threads:
+                thread_id, default_model = await self._start_thread(instructions)
+                if self._spares.get(instructions) is not spares:  # evicted or reset meanwhile
+                    self._forget("thread/unsubscribe", {"threadId": thread_id})
+                    return
+                spares.append((thread_id, default_model, time.monotonic()))
+        except Exception as exc:  # spares are an optimisation; requests start threads themselves
+            logger.debug("spare thread refill failed: %s", exc)
+        finally:
+            if self._refills.get(instructions) is asyncio.current_task():
+                del self._refills[instructions]
+
     # --- turns -------------------------------------------------------------------
 
     def resolve_effort(self, model: Optional[str], effort: Optional[str]) -> Optional[str]:
@@ -456,21 +525,16 @@ class AppServerClient:
         def mark(name: str) -> None:
             timings[name] = time.perf_counter()
 
+        instructions = instructions or DEFAULT_INSTRUCTIONS
         async with self._limiter.slot():
             mark("slot")
             await self.start()
-            thread_params: Dict[str, Any] = {
-                "cwd": str(Path(settings.codex_workdir).expanduser()),
-                "ephemeral": True,
-                "approvalPolicy": "never",
-                "sandbox": settings.sandbox_mode,
-                "baseInstructions": instructions or DEFAULT_INSTRUCTIONS,
-            }
-            if model:
-                thread_params["model"] = model
-            thread = await self._request("thread/start", thread_params)
-            thread_id = thread["thread"]["id"]
-            model = result.model = model or thread.get("model")
+            spare = self._take_spare(instructions)
+            thread_id, default_model = spare or await self._start_thread(instructions)
+            self._refill_spares(instructions)
+            # The model is chosen per turn; the thread's default applies when none was requested.
+            requested_model = model
+            model = result.model = model or default_model
             effort = self.resolve_effort(model, effort)
             queue: asyncio.Queue = asyncio.Queue()
             self._threads[thread_id] = queue
@@ -484,12 +548,26 @@ class AppServerClient:
                         user_input.append({"type": "image", "url": image})
                     else:
                         user_input.append({"type": "localImage", "path": image})
-                params: Dict[str, Any] = {"threadId": thread_id, "input": user_input}
+                params: Dict[str, Any] = {"input": user_input}
+                if requested_model:
+                    params["model"] = requested_model
                 if effort:
                     params["effort"] = effort
                 if output_schema is not None:
                     params["outputSchema"] = output_schema
-                turn = await self._request("turn/start", params)
+                try:
+                    turn = await self._request("turn/start", {"threadId": thread_id, **params})
+                except CodexError:
+                    if spare is None:
+                        raise
+                    # A spare thread went bad (e.g. unloaded); retry once on a fresh one.
+                    logger.warning("[%s] spare thread %s rejected the turn; starting a new thread", request_id, thread_id)
+                    self._threads.pop(thread_id, None)
+                    self._forget("thread/unsubscribe", {"threadId": thread_id})
+                    spare = None
+                    thread_id, _ = await self._start_thread(instructions)
+                    self._threads[thread_id] = queue
+                    turn = await self._request("turn/start", {"threadId": thread_id, **params})
                 turn_id = (turn.get("turn") or {}).get("id")
                 mark("turn_started")
 
@@ -552,7 +630,7 @@ class AppServerClient:
                     if not completed and turn_id:
                         self._forget("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
                     self._forget("thread/unsubscribe", {"threadId": thread_id})
-                _log_timings(request_id, model, effort, timings, result.usage, completed)
+                _log_timings(request_id, model, effort, timings, result.usage, completed, spare is not None)
 
 
 def _log_timings(
@@ -562,6 +640,7 @@ def _log_timings(
     timings: Dict[str, float],
     usage: Optional[Dict[str, int]],
     completed: bool,
+    spare: bool,
 ) -> None:
     start = timings["received"]
 
@@ -571,12 +650,13 @@ def _log_timings(
 
     end = timings.get("done") or time.perf_counter()
     logger.info(
-        "[%s] codex model=%s effort=%s slot=%s thread=%s turn=%s first_token=%s total=%.0fms%s%s",
+        "[%s] codex model=%s effort=%s slot=%s thread=%s%s turn=%s first_token=%s total=%.0fms%s%s",
         request_id,
         model,
         effort or "default",
         ms("slot"),
         ms("thread_started"),
+        " (spare)" if spare else "",
         ms("turn_started"),
         ms("first_token"),
         (end - start) * 1000,

@@ -8,17 +8,17 @@ A FastAPI server that puts an OpenAI-compatible API in front of the [Codex CLI](
 
 ## How requests are served
 
-The server keeps one `codex app-server` process running and gives every request its own short-lived (ephemeral) Codex thread on it. Requests run in parallel (up to `CODEX_MAX_PARALLEL_REQUESTS`, default 8) and their streams never mix.
+The server keeps one `codex app-server` process running and gives every request its own short-lived (ephemeral) Codex thread on it. Requests run in parallel (up to `CODEX_MAX_PARALLEL_REQUESTS`, default 8) and their streams never mix. A thread's system prompt is fixed when it starts, but the model and effort are chosen per turn, so the server keeps a few pre-started spare threads for each recently used system prompt (`CODEX_IDLE_THREADS`, default 2). A request whose system prompt has a spare skips thread start and the per-thread setup Codex does before its first turn, which saves about 0.6–1 s. Spares are never reused: each one serves exactly one request and is then replaced in the background.
 
 The app-server is started with a lean profile: plugins, MCP servers, hooks, shell/browser/computer-use tools, skills and the injected sandbox/environment instructions are turned off, and the client's `system` message replaces Codex's agent prompt. A tiny request costs about 2.3k input tokens instead of about 13k.
 
 Measured on Windows with `gpt-5.6-luna` (ChatGPT sign-in), using `scripts/bench_latency.py`:
 
-| | `codex exec` per request (old) | `codex app-server` (now) |
-|---|---|---|
-| small prompt, total | 4.6–5.4 s | 2.0–2.7 s |
-| streamed, first token | 4.3–4.5 s | 1.8–2.4 s |
-| 8 concurrent requests, wall | 20–27 s | 2.4–3.3 s |
+| | `codex exec` per request (old) | `codex app-server` | app-server + spare threads (now) |
+|---|---|---|---|
+| small prompt, total | 4.6–5.4 s | 2.0–2.7 s | 1.4–2.0 s |
+| streamed, first token | 4.1–4.5 s | 1.9–2.5 s | 1.0–1.3 s |
+| 8 concurrent requests, wall | 20–27 s | 2.4–3.5 s | 2.3–2.8 s |
 | `response_format: json_schema` | ignored | enforced |
 | `usage` | zeros | real token counts |
 
@@ -89,6 +89,7 @@ All settings are environment variables (a `.env` file is loaded automatically). 
 |---|---|---|
 | `CODEX_LEAN` | `true` | Disable plugins, MCP servers, hooks, tools and injected instructions in the app-server |
 | `CODEX_MAX_PARALLEL_REQUESTS` | `8` | Concurrent Codex turns |
+| `CODEX_IDLE_THREADS` | `2` | Pre-started spare threads per system prompt (`0` disables) |
 | `CODEX_TIMEOUT` | `120` | Seconds per request |
 | `PROXY_API_KEY` | unset | Require `Authorization: Bearer <key>` |
 | `RATE_LIMIT_PER_MINUTE` | `0` (off) | Requests per minute per client IP |
@@ -104,7 +105,7 @@ The wrapper uses your Codex home (`$CODEX_HOME`, default `~/.codex`) for auth an
 Each request logs its phases, for example:
 
 ```
-[8e1d3705] app-server model=gpt-5.6-luna effort=low slot=0ms thread=173ms turn=188ms first_token=2359ms total=2470ms in=2341 cached=2176 out=8
+[b46e2a61] codex model=gpt-5.6-luna effort=low slot=0ms thread=0ms (spare) turn=5ms first_token=1131ms total=1588ms in=2350 cached=0 out=83
 ```
 
 `scripts/bench_latency.py` measures time to first token and total time for streamed and non-streamed calls, a ~3k-token prompt, strict JSON schemas, `GET /models` and a burst of concurrent requests:
