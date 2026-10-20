@@ -1,5 +1,5 @@
 services:
-  codex-wrapper:
+  codex-openai-bridge:
     build:
       context: .
       dockerfile: Dockerfile
@@ -7,7 +7,7 @@ services:
         CODEX_UID: ${HOST_UID:-1000}
         CODEX_GID: ${HOST_GID:-1000}
     restart: unless-stopped
-    image: codex-wrapper:latest
+    image: codex-openai-bridge:latest
     env_file:
       - .env
     environment:

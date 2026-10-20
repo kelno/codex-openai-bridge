@@ -68,7 +68,7 @@ async def lifespan(_app: FastAPI):
         await codex.close()
 
 
-app = FastAPI(title="Codex Wrapper", lifespan=lifespan)
+app = FastAPI(title="Codex OpenAI Bridge", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _guards = [Depends(rate_limiter), Depends(verify_api_key)]

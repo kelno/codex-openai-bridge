@@ -16,7 +16,7 @@ def _default_codex_workdir() -> str:
 
     if os.name == "nt":
         base = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        return str(Path(base) / "codex-wrapper" / "workspace")
+        return str(Path(base) / "codex-openai-bridge" / "workspace")
     return "/workspace"
 
 

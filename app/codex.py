@@ -262,7 +262,7 @@ class AppServerClient:
             await self._request(
                 "initialize",
                 {
-                    "clientInfo": {"name": "codex-wrapper", "title": "Codex Wrapper", "version": "0.2.0"},
+                    "clientInfo": {"name": "codex-openai-bridge", "title": "Codex OpenAI Bridge", "version": "0.2.0"},
                     "capabilities": {"optOutNotificationMethods": _OPT_OUT_NOTIFICATIONS},
                 },
             )
@@ -375,7 +375,7 @@ class AppServerClient:
         if "id" in msg:
             # Server-initiated request (approval, elicitation, ...). Deny it.
             logger.warning("Denying app-server request %s", method)
-            self._send({"id": msg["id"], "error": {"code": -32601, "message": "not supported by codex-wrapper"}})
+            self._send({"id": msg["id"], "error": {"code": -32601, "message": "not supported by codex-openai-bridge"}})
             return
         queue = self._threads.get(params.get("threadId") or "")
         if queue is not None:

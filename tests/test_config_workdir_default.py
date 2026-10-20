@@ -15,7 +15,7 @@ def test_default_workdir_windows_uses_localappdata(monkeypatch, tmp_path):
 
     monkeypatch.setattr(config.os, "name", "nt")
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    assert Path(config._default_codex_workdir()) == tmp_path / "codex-wrapper" / "workspace"
+    assert Path(config._default_codex_workdir()) == tmp_path / "codex-openai-bridge" / "workspace"
 
 
 def test_env_overrides_default(monkeypatch, tmp_path):

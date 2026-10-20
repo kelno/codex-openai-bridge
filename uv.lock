@@ -47,7 +47,7 @@ wheels = [
 ]
 
 [[package]]
-name = "codex-wrapper"
+name = "codex-openai-bridge"
 version = "0.2.0"
 source = { virtual = "." }
 dependencies = [

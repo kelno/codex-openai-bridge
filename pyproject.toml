@@ -1,5 +1,5 @@
 [project]
-name = "codex-wrapper"
+name = "codex-openai-bridge"
 version = "0.2.0"
 description = "OpenAI-compatible API (chat completions, responses) served through the Codex CLI"
 readme = "README.md"

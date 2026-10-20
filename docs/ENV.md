@@ -14,7 +14,7 @@ The server reads its settings from environment variables. A `.env` file in the r
 | `CODEX_LEAN` | `true` | Start the app-server with plugins, apps, hooks, multi-agent, shell/browser/computer-use tools, image generation, skills, web search, the `notify` hook and every configured MCP server turned off, and without Codex's sandbox-permission and environment-context instructions. Set `false` to expose the full Codex agent. |
 | `CODEX_HOME` | `~/.codex` | Codex's own variable: where `auth.json`, `config.toml` and `AGENTS.md` live. The server passes it through to Codex. |
 
-`CODEX_WORKDIR` defaults to `/workspace` on Linux/macOS (the Docker layout) and `%LOCALAPPDATA%\codex-wrapper\workspace` on Windows. On Windows use an absolute path with a drive letter, because `/workspace` resolves to the root of the current drive.
+`CODEX_WORKDIR` defaults to `/workspace` on Linux/macOS (the Docker layout) and `%LOCALAPPDATA%\codex-openai-bridge\workspace` on Windows. On Windows use an absolute path with a drive letter, because `/workspace` resolves to the root of the current drive.
 
 ## Codex credentials
 

@@ -1,4 +1,4 @@
-# Codex-Wrapper
+# codex-openai-bridge
 
 A FastAPI server that puts an OpenAI-compatible API in front of the [Codex CLI](https://github.com/openai/codex), so any OpenAI client can use a ChatGPT/Codex sign-in (or a Codex API-key login) by changing `base_url`. It needs a Codex CLI recent enough to have `codex app-server` (tested with 0.163).
 
@@ -117,7 +117,7 @@ uv run python scripts/bench_latency.py --base http://127.0.0.1:8000/v1 --runs 3
 
 ```bash
 docker compose build
-docker compose run --rm codex-wrapper codex login   # once, stores auth in the mounted ~/.codex
+docker compose run --rm codex-openai-bridge codex login   # once, stores auth in the mounted ~/.codex
 docker compose up
 ```
 
