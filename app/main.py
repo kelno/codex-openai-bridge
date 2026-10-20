@@ -1,4 +1,5 @@
 import json
+import logging.config
 import os
 import time
 import uuid
@@ -7,6 +8,7 @@ from typing import AsyncIterator, List
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from uvicorn.config import LOGGING_CONFIG
 
 from .codex import CodexError, run_codex, run_codex_last_message
 from .config import settings
@@ -29,6 +31,14 @@ from .schemas import (
     ResponsesMessage,
     ResponsesOutputText,
 )
+
+# Prefix uvicorn's server and access (request) logs with a timestamp.
+# The uvicorn CLI configures logging before importing this module, so re-apply it.
+LOGGING_CONFIG["formatters"]["default"]["fmt"] = "%(asctime)s [%(name)s] %(levelprefix)s %(message)s"
+LOGGING_CONFIG["formatters"]["access"]["fmt"] = (
+    '%(asctime)s [%(name)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+)
+logging.config.dictConfig(LOGGING_CONFIG)
 
 app = FastAPI()
 
